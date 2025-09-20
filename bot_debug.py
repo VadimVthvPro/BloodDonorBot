@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 # Состояния для ConversationHandler
 CHOOSING_ROLE, ENTERING_PASSWORD, ENTERING_BLOOD_TYPE, ENTERING_LOCATION, \
     ENTERING_LAST_DONATION, USER_MENU, DOCTOR_MENU, ENTERING_DONATION_REQUEST, \
-    ENTERING_REQUEST_LOCATION, ENTERING_REQUEST_ADDRESS, ENTERING_REQUEST_DATE, \
-    UPDATE_LOCATION, UPDATE_DONATION_DATE = range(13)
+    ENTERING_REQUEST_LOCATION, ENTERING_REQUEST_ADDRESS, ENTERING_REQUEST_HOSPITAL, \
+    ENTERING_REQUEST_CONTACT, ENTERING_REQUEST_DATE, UPDATE_LOCATION, UPDATE_DONATION_DATE = range(15)
 
 # Мастер-пароль для врачей
 MASTER_PASSWORD = "doctor2024"
@@ -595,7 +595,34 @@ class BloodDonorBot:
 
         await update.message.reply_text(
             "✅ Адрес учреждения сохранен!\n\n"
-            "Укажите дату, когда нужна кровь (ДД.ММ.ГГГГ):"
+            "🏥 Теперь укажите название медицинского центра/больницы:"
+        )
+        return ENTERING_REQUEST_HOSPITAL
+
+    async def handle_request_hospital(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка ввода названия медицинского центра"""
+        hospital_name = update.message.text
+        context.user_data['request_hospital'] = hospital_name
+
+        logger.info(f"Указано название медицинского центра: {hospital_name}")
+
+        await update.message.reply_text(
+            "✅ Название медицинского центра сохранено!\n\n"
+            "📞 Укажите контактную информацию для доноров\n"
+            "(телефон, email, ФИО ответственного):"
+        )
+        return ENTERING_REQUEST_CONTACT
+
+    async def handle_request_contact(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка ввода контактной информации"""
+        contact_info = update.message.text
+        context.user_data['request_contact'] = contact_info
+
+        logger.info(f"Указана контактная информация: {contact_info}")
+
+        await update.message.reply_text(
+            "✅ Контактная информация сохранена!\n\n"
+            "📅 Укажите дату, когда нужна кровь (ДД.ММ.ГГГГ):"
         )
         return ENTERING_REQUEST_DATE
 
@@ -615,6 +642,7 @@ class BloodDonorBot:
         logger.info(
             f"Сохранение запроса в БД: врач {user.id}, группа {context.user_data['request_blood_type']}, "
             f"город {context.user_data['request_location']}, адрес {context.user_data['request_address']}, "
+            f"медцентр {context.user_data['request_hospital']}, контакты {context.user_data['request_contact']}, "
             f"дата {request_date}")
 
         try:
@@ -622,10 +650,11 @@ class BloodDonorBot:
             cursor = conn.cursor()
 
             cursor.execute("""
-                INSERT INTO donation_requests (doctor_id, blood_type, location, address, request_date)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO donation_requests (doctor_id, blood_type, location, address, hospital_name, contact_info, request_date)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (user.id, context.user_data['request_blood_type'],
-                  context.user_data['request_location'], context.user_data['request_address'], request_date))
+                  context.user_data['request_location'], context.user_data['request_address'],
+                  context.user_data['request_hospital'], context.user_data['request_contact'], request_date))
 
             conn.commit()
             cursor.close()
@@ -638,6 +667,8 @@ class BloodDonorBot:
                 context.user_data['request_blood_type'],
                 context.user_data['request_location'],
                 context.user_data['request_address'],
+                context.user_data['request_hospital'],
+                context.user_data['request_contact'],
                 request_date
             )
 
@@ -645,7 +676,9 @@ class BloodDonorBot:
                 f"✅ Запрос создан!\n\n"
                 f"🩸 Группа крови: {context.user_data['request_blood_type']}\n"
                 f"📍 Город: {context.user_data['request_location']}\n"
-                f"🏥 Адрес: {context.user_data['request_address']}\n"
+                f"🏥 Медцентр: {context.user_data['request_hospital']}\n"
+                f"📍 Адрес: {context.user_data['request_address']}\n"
+                f"📞 Контакты: {context.user_data['request_contact']}\n"
                 f"📅 Дата: {request_date.strftime('%d.%m.%Y')}\n\n"
                 f"Уведомления отправлены всем подходящим донорам."
             )
@@ -666,7 +699,9 @@ class BloodDonorBot:
 
             cursor.execute("""
                 SELECT id, doctor_id, blood_type, location, 
-                       COALESCE(address, 'Адрес не указан') as address, 
+                       COALESCE(hospital_name, 'Не указано') as hospital_name,
+                       COALESCE(address, 'Адрес не указан') as address,
+                       COALESCE(contact_info, 'Не указано') as contact_info,
                        request_date, description, created_at 
                 FROM donation_requests 
                 WHERE doctor_id = %s 
@@ -678,8 +713,11 @@ class BloodDonorBot:
 
             if requests:
                 text = "📋 Ваши последние запросы:\n\n"
-                for req in requests:
-                    text += f"🩸 {req['blood_type']} | 📍 {req['location']} | 🏥 {req['address']}\n"
+                for i, req in enumerate(requests, 1):
+                    text += f"{i}. 🩸 {req['blood_type']} | 📍 {req['location']}\n"
+                    text += f"🏥 {req['hospital_name']}\n"
+                    text += f"📍 {req['address']}\n"
+                    text += f"📞 {req['contact_info']}\n"
                     text += f"📅 {req['request_date'].strftime('%d.%m.%Y')} | 🕒 {req['created_at'].strftime('%d.%m.%Y %H:%M')}\n\n"
             else:
                 text = "У вас пока нет созданных запросов."
@@ -738,7 +776,10 @@ class BloodDonorBot:
 
             # Последние 5 запросов
             cursor.execute("""
-                SELECT blood_type, location, COALESCE(address, 'Адрес не указан') as address, request_date 
+                SELECT blood_type, location, 
+                       COALESCE(hospital_name, 'Не указано') as hospital_name,
+                       COALESCE(address, 'Адрес не указан') as address, 
+                       request_date 
                 FROM donation_requests 
                 ORDER BY created_at DESC 
                 LIMIT 5
@@ -748,8 +789,9 @@ class BloodDonorBot:
             if recent_requests:
                 for i, req in enumerate(recent_requests, 1):
                     stats_text += (f"\n{i}. 🩸 {req['blood_type']} | 📍 {req['location']}\n"
-                                   f"🏥 Адрес: {req['address']}\n"
-                                   f"📅 Дата: {req['request_date'].strftime('%d.%m.%Y')}")
+                                   f"🏥 {req['hospital_name']}\n"
+                                   f"📍 {req['address']}\n"
+                                   f"📅 {req['request_date'].strftime('%d.%m.%Y')}")
             else:
                 stats_text += "\nПока нет запросов крови."
 
@@ -764,9 +806,9 @@ class BloodDonorBot:
             logger.error(f"Ошибка показа статистики: {e}")
             await update.callback_query.edit_message_text("Произошла ошибка при загрузке статистики.")
 
-    async def notify_donors(self, blood_type: str, location: str, address: str, request_date):
+    async def notify_donors(self, blood_type: str, location: str, address: str, hospital_name: str, contact_info: str, request_date):
         """Отправляет уведомления донорам"""
-        logger.info(f"Отправка уведомлений донорам группы {blood_type} в {location} по адресу {address}")
+        logger.info(f"Отправка уведомлений донорам группы {blood_type} в {location} ({hospital_name})")
 
         try:
             conn = self.get_db_connection()
@@ -796,10 +838,14 @@ class BloodDonorBot:
 
 🩸 Группа крови: {blood_type}
 📍 Город: {location}
-🏥 Адрес учреждения: {address}
+🏥 Медицинский центр: {hospital_name}
+📍 Адрес: {address}
 📅 Дата: {request_date.strftime('%d.%m.%Y')}
 
-Если вы можете помочь, пожалуйста, свяжитесь с медицинским учреждением.
+📞 Контактная информация:
+{contact_info}
+
+Если вы можете помочь, пожалуйста, свяжитесь с медицинским учреждением по указанным контактам.
 
 Спасибо за вашу готовность помочь! ❤️
                     """
@@ -875,6 +921,10 @@ class BloodDonorBot:
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_request_location)],
                 ENTERING_REQUEST_ADDRESS: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_request_address)],
+                ENTERING_REQUEST_HOSPITAL: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_request_hospital)],
+                ENTERING_REQUEST_CONTACT: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_request_contact)],
                 ENTERING_REQUEST_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_request_date)],
                 USER_MENU: [CallbackQueryHandler(self.handle_menu_callback)],
                 DOCTOR_MENU: [CallbackQueryHandler(self.handle_menu_callback)],
