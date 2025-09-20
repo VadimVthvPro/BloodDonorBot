@@ -310,6 +310,7 @@ class BloodDonorBot:
         """Показывает меню пользователя"""
         keyboard = [
             [InlineKeyboardButton("📊 Моя информация", callback_data="user_info")],
+            [InlineKeyboardButton("🩸 Мои донации", callback_data="my_donations")],
             [InlineKeyboardButton("📅 Обновить дату сдачи", callback_data="update_donation")],
             [InlineKeyboardButton("📍 Изменить местоположение", callback_data="update_location")],
             [InlineKeyboardButton("❓ Помощь", callback_data="help")]
@@ -332,6 +333,7 @@ class BloodDonorBot:
         keyboard = [
             [InlineKeyboardButton("🩸 Создать запрос крови", callback_data="create_request")],
             [InlineKeyboardButton("📋 Мои запросы", callback_data="my_requests")],
+            [InlineKeyboardButton("👥 Отклики доноров", callback_data="donor_responses")],
             [InlineKeyboardButton("📊 Статистика", callback_data="statistics")],
             [InlineKeyboardButton("❓ Помощь", callback_data="help")]
         ]
@@ -358,6 +360,9 @@ class BloodDonorBot:
         if query.data == "user_info":
             await self.show_user_info(update, context)
             return USER_MENU
+        elif query.data == "my_donations":
+            await self.show_my_donations(update, context)
+            return USER_MENU
         elif query.data == "update_donation":
             await query.edit_message_text(
                 "📅 Обновление даты последней сдачи крови\n\n"
@@ -378,6 +383,9 @@ class BloodDonorBot:
         elif query.data == "my_requests":
             await self.show_my_requests(update, context)
             return DOCTOR_MENU
+        elif query.data == "donor_responses":
+            await self.show_donor_responses(update, context)
+            return DOCTOR_MENU
         elif query.data == "statistics":
             await self.show_statistics(update, context)
             return DOCTOR_MENU
@@ -387,6 +395,12 @@ class BloodDonorBot:
                 return DOCTOR_MENU
             else:
                 return USER_MENU
+        elif query.data.startswith("respond_"):
+            # Обработка отклика донора
+            await self.handle_donor_response(update, context)
+            # После отклика показываем меню донора
+            await self.show_user_menu(update, context)
+            return USER_MENU
         elif query.data == "back_to_menu":
             user = update.effective_user
             try:
@@ -459,6 +473,52 @@ class BloodDonorBot:
             conn.close()
         except Exception as e:
             logger.error(f"Ошибка показа информации пользователя: {e}")
+
+    async def show_my_donations(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает донации пользователя"""
+        user = update.effective_user
+        try:
+            conn = self.get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+            # Получаем все отклики пользователя
+            cursor.execute("""
+                SELECT dr.blood_type, dr.hospital_name, dr.location, dr.address, 
+                       dr.contact_info, dr.request_date, resp.responded_at,
+                       dr.created_at
+                FROM donor_responses resp
+                JOIN donation_requests dr ON resp.request_id = dr.id
+                WHERE resp.donor_id = %s
+                ORDER BY resp.responded_at DESC
+                LIMIT 10
+            """, (user.id,))
+
+            donations = cursor.fetchall()
+
+            if donations:
+                text = "🩸 Мои донации (отклики):\n\n"
+                for i, donation in enumerate(donations, 1):
+                    status_emoji = "📅" if donation['request_date'] >= datetime.now().date() else "✅"
+                    
+                    text += f"{i}. {status_emoji} 🩸 {donation['blood_type']} | 📍 {donation['location']}\n"
+                    text += f"🏥 {donation['hospital_name']}\n"
+                    text += f"📍 {donation['address']}\n"
+                    text += f"📞 {donation['contact_info']}\n"
+                    text += f"📅 Дата донации: {donation['request_date'].strftime('%d.%m.%Y')}\n"
+                    text += f"🕒 Откликнулись: {donation['responded_at'].strftime('%d.%m.%Y %H:%M')}\n\n"
+            else:
+                text = "У вас пока нет откликов на донации.\n\nКогда появятся запросы крови вашей группы, вы получите уведомления."
+
+            keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+
+            cursor.close()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Ошибка показа донаций пользователя: {e}")
+            await update.callback_query.edit_message_text("Произошла ошибка при загрузке донаций.")
 
     async def update_location(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обновляет местоположение пользователя"""
@@ -652,15 +712,19 @@ class BloodDonorBot:
             cursor.execute("""
                 INSERT INTO donation_requests (doctor_id, blood_type, location, address, hospital_name, contact_info, request_date)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
             """, (user.id, context.user_data['request_blood_type'],
                   context.user_data['request_location'], context.user_data['request_address'],
                   context.user_data['request_hospital'], context.user_data['request_contact'], request_date))
 
+            # Получаем ID созданного запроса
+            request_id = cursor.fetchone()[0]
+            
             conn.commit()
             cursor.close()
             conn.close()
 
-            logger.info("✅ Запрос успешно сохранен в БД")
+            logger.info(f"✅ Запрос успешно сохранен в БД с ID {request_id}")
 
             # Отправляем уведомления всем подходящим донорам
             await self.notify_donors(
@@ -669,7 +733,8 @@ class BloodDonorBot:
                 context.user_data['request_address'],
                 context.user_data['request_hospital'],
                 context.user_data['request_contact'],
-                request_date
+                request_date,
+                request_id
             )
 
             await update.message.reply_text(
@@ -698,14 +763,19 @@ class BloodDonorBot:
             cursor = conn.cursor(cursor_factory=RealDictCursor)
 
             cursor.execute("""
-                SELECT id, doctor_id, blood_type, location, 
-                       COALESCE(hospital_name, 'Не указано') as hospital_name,
-                       COALESCE(address, 'Адрес не указан') as address,
-                       COALESCE(contact_info, 'Не указано') as contact_info,
-                       request_date, description, created_at 
-                FROM donation_requests 
-                WHERE doctor_id = %s 
-                ORDER BY created_at DESC 
+                SELECT dr.id, dr.doctor_id, dr.blood_type, dr.location, 
+                       COALESCE(dr.hospital_name, 'Не указано') as hospital_name,
+                       COALESCE(dr.address, 'Адрес не указан') as address,
+                       COALESCE(dr.contact_info, 'Не указано') as contact_info,
+                       dr.request_date, dr.description, dr.created_at,
+                       COUNT(resp.id) as response_count
+                FROM donation_requests dr
+                LEFT JOIN donor_responses resp ON dr.id = resp.request_id
+                WHERE dr.doctor_id = %s 
+                GROUP BY dr.id, dr.doctor_id, dr.blood_type, dr.location, 
+                         dr.hospital_name, dr.address, dr.contact_info,
+                         dr.request_date, dr.description, dr.created_at
+                ORDER BY dr.created_at DESC 
                 LIMIT 10
             """, (user.id,))
 
@@ -714,7 +784,9 @@ class BloodDonorBot:
             if requests:
                 text = "📋 Ваши последние запросы:\n\n"
                 for i, req in enumerate(requests, 1):
-                    text += f"{i}. 🩸 {req['blood_type']} | 📍 {req['location']}\n"
+                    response_text = f"📊 Откликов: {req['response_count']}"
+                    
+                    text += f"{i}. 🩸 {req['blood_type']} | 📍 {req['location']} | {response_text}\n"
                     text += f"🏥 {req['hospital_name']}\n"
                     text += f"📍 {req['address']}\n"
                     text += f"📞 {req['contact_info']}\n"
@@ -732,6 +804,78 @@ class BloodDonorBot:
         except Exception as e:
             logger.error(f"Ошибка показа запросов врача: {e}")
             await update.callback_query.edit_message_text("Произошла ошибка при загрузке запросов.")
+
+    async def show_donor_responses(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает отклики доноров на запросы врача"""
+        user = update.effective_user
+        try:
+            conn = self.get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+            cursor.execute("""
+                SELECT dr.blood_type, dr.hospital_name, dr.location, dr.request_date,
+                       u.first_name, u.last_name, u.username, u.blood_type as donor_blood_type,
+                       u.location as donor_location, resp.responded_at, dr.id as request_id
+                FROM donor_responses resp
+                JOIN donation_requests dr ON resp.request_id = dr.id
+                JOIN users u ON resp.donor_id = u.telegram_id
+                WHERE dr.doctor_id = %s
+                ORDER BY resp.responded_at DESC
+                LIMIT 20
+            """, (user.id,))
+
+            responses = cursor.fetchall()
+
+            if responses:
+                text = "👥 Отклики доноров на ваши запросы:\n\n"
+                
+                # Группируем по запросам
+                requests_dict = {}
+                for resp in responses:
+                    req_id = resp['request_id']
+                    if req_id not in requests_dict:
+                        requests_dict[req_id] = {
+                            'info': resp,
+                            'donors': []
+                        }
+                    requests_dict[req_id]['donors'].append(resp)
+                
+                for i, (req_id, req_data) in enumerate(requests_dict.items(), 1):
+                    req_info = req_data['info']
+                    donors = req_data['donors']
+                    
+                    text += f"{i}. 🩸 {req_info['blood_type']} | 📅 {req_info['request_date'].strftime('%d.%m.%Y')}\n"
+                    text += f"🏥 {req_info['hospital_name']} | 📍 {req_info['location']}\n"
+                    text += f"👥 Откликнулось доноров: {len(donors)}\n\n"
+                    
+                    for j, donor in enumerate(donors, 1):
+                        donor_name = donor['first_name']
+                        if donor['last_name']:
+                            donor_name += f" {donor['last_name']}"
+                        
+                        username = f"@{donor['username']}" if donor['username'] else "нет username"
+                        
+                        text += f"  {j}. {donor_name} ({username})\n"
+                        text += f"     🩸 {donor['donor_blood_type']} | 📍 {donor['donor_location']}\n"
+                        text += f"     🕒 {donor['responded_at'].strftime('%d.%m.%Y %H:%M')}\n\n"
+                    
+                    if i >= 5:  # Показываем максимум 5 запросов
+                        text += "...\n"
+                        break
+                        
+            else:
+                text = "Пока нет откликов на ваши запросы.\n\nКогда доноры начнут откликаться, информация появится здесь."
+
+            keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+
+            cursor.close()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Ошибка показа откликов доноров: {e}")
+            await update.callback_query.edit_message_text("Произошла ошибка при загрузке откликов.")
 
     async def show_statistics(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показывает статистику для врача"""
@@ -774,26 +918,39 @@ class BloodDonorBot:
 
             stats_text += "\n📋 Последние 5 запросов крови:\n"
 
-            # Последние 5 запросов
+            # Последние 5 запросов с количеством откликов
             cursor.execute("""
-                SELECT blood_type, location, 
-                       COALESCE(hospital_name, 'Не указано') as hospital_name,
-                       COALESCE(address, 'Адрес не указан') as address, 
-                       request_date 
-                FROM donation_requests 
-                ORDER BY created_at DESC 
+                SELECT dr.blood_type, dr.location, 
+                       COALESCE(dr.hospital_name, 'Не указано') as hospital_name,
+                       COALESCE(dr.address, 'Адрес не указан') as address, 
+                       dr.request_date,
+                       COUNT(resp.id) as response_count
+                FROM donation_requests dr
+                LEFT JOIN donor_responses resp ON dr.id = resp.request_id
+                GROUP BY dr.id, dr.blood_type, dr.location, dr.hospital_name, dr.address, dr.request_date, dr.created_at
+                ORDER BY dr.created_at DESC 
                 LIMIT 5
             """)
             recent_requests = cursor.fetchall()
 
             if recent_requests:
                 for i, req in enumerate(recent_requests, 1):
-                    stats_text += (f"\n{i}. 🩸 {req['blood_type']} | 📍 {req['location']}\n"
+                    stats_text += (f"\n{i}. 🩸 {req['blood_type']} | 📍 {req['location']} | 📊 {req['response_count']} откл.\n"
                                    f"🏥 {req['hospital_name']}\n"
                                    f"📍 {req['address']}\n"
                                    f"📅 {req['request_date'].strftime('%d.%m.%Y')}")
             else:
                 stats_text += "\nПока нет запросов крови."
+
+            # Добавляем общую статистику по откликам
+            cursor.execute("""
+                SELECT COUNT(*) as total_responses
+                FROM donor_responses
+            """)
+            total_responses_result = cursor.fetchone()
+            total_responses = total_responses_result['total_responses'] if total_responses_result else 0
+
+            stats_text += f"\n\n📊 Общая статистика откликов: {total_responses}"
 
             keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -806,7 +963,7 @@ class BloodDonorBot:
             logger.error(f"Ошибка показа статистики: {e}")
             await update.callback_query.edit_message_text("Произошла ошибка при загрузке статистики.")
 
-    async def notify_donors(self, blood_type: str, location: str, address: str, hospital_name: str, contact_info: str, request_date):
+    async def notify_donors(self, blood_type: str, location: str, address: str, hospital_name: str, contact_info: str, request_date, request_id: int):
         """Отправляет уведомления донорам"""
         logger.info(f"Отправка уведомлений донорам группы {blood_type} в {location} ({hospital_name})")
 
@@ -845,15 +1002,22 @@ class BloodDonorBot:
 📞 Контактная информация:
 {contact_info}
 
-Если вы можете помочь, пожалуйста, свяжитесь с медицинским учреждением по указанным контактам.
+Если вы можете помочь, пожалуйста, нажмите кнопку ниже или свяжитесь с медицинским учреждением по указанным контактам.
 
 Спасибо за вашу готовность помочь! ❤️
                     """
 
+                    # Создаем кнопку отклика
+                    keyboard = [
+                        [InlineKeyboardButton("✅ Могу помочь!", callback_data=f"respond_{request_id}")]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+
                     try:
                         await self.application.bot.send_message(
                             chat_id=donor['telegram_id'],
-                            text=message
+                            text=message,
+                            reply_markup=reply_markup
                         )
                         sent_count += 1
                         logger.info(f"Уведомление отправлено донору {donor['telegram_id']}")
@@ -865,6 +1029,184 @@ class BloodDonorBot:
             conn.close()
         except Exception as e:
             logger.error(f"Ошибка при отправке уведомлений: {e}")
+
+    async def handle_donor_response(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка отклика донора на запрос крови"""
+        query = update.callback_query
+        await query.answer()
+        
+        # Извлекаем ID запроса из callback_data
+        request_id = int(query.data.replace("respond_", ""))
+        donor_id = update.effective_user.id
+        
+        logger.info(f"Донор {donor_id} откликается на запрос {request_id}")
+        
+        try:
+            conn = self.get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            # Проверяем, не откликался ли донор уже на этот запрос
+            cursor.execute("""
+                SELECT id FROM donor_responses 
+                WHERE request_id = %s AND donor_id = %s
+            """, (request_id, donor_id))
+            
+            if cursor.fetchone():
+                await query.edit_message_text(
+                    "ℹ️ Вы уже откликались на этот запрос.\n\n"
+                    "Спасибо за вашу готовность помочь! ❤️"
+                )
+                cursor.close()
+                conn.close()
+                return
+            
+            # Сохраняем отклик в базу данных
+            cursor.execute("""
+                INSERT INTO donor_responses (request_id, donor_id, response_type)
+                VALUES (%s, %s, 'interested')
+            """, (request_id, donor_id))
+            
+            # Получаем информацию о запросе и доноре
+            cursor.execute("""
+                SELECT dr.doctor_id, dr.blood_type, dr.hospital_name, dr.location, dr.request_date,
+                       u.first_name, u.last_name, u.username
+                FROM donation_requests dr
+                JOIN users u ON dr.doctor_id = u.telegram_id
+                WHERE dr.id = %s
+            """, (request_id,))
+            
+            request_info = cursor.fetchone()
+            
+            # Получаем информацию о доноре
+            cursor.execute("""
+                SELECT first_name, last_name, username, blood_type, location
+                FROM users WHERE telegram_id = %s
+            """, (donor_id,))
+            
+            donor_info = cursor.fetchone()
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            # Убираем кнопку отклика и показываем подтверждение
+            await query.edit_message_text(
+                query.message.text + "\n\n✅ ВЫ ОТКЛИКНУЛИСЬ НА ЭТОТ ЗАПРОС!"
+            )
+
+            # Получаем полную информацию о запросе из базы данных
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute("""
+                SELECT hospital_name, address, contact_info
+                FROM donation_requests 
+                WHERE id = %s
+            """, (request_id,))
+            full_request_info = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            
+            # Отправляем подробную информацию о предстоящей донации
+            donation_info = f"""
+🎯 ЗАПЛАНИРОВАННАЯ ДОНАЦИЯ
+
+🩸 Группа крови: {request_info['blood_type']}
+📅 Дата: {request_info['request_date'].strftime('%d.%m.%Y')}
+
+🏥 Медицинский центр: {full_request_info['hospital_name'] or 'Не указано'}
+📍 Адрес: {full_request_info['address'] or 'Не указан'}
+
+📞 Контактная информация:
+{full_request_info['contact_info'] or 'Не указано'}
+
+❗ ВАЖНО:
+• Не забудьте покушать за 2-3 часа до сдачи
+• Выспитесь накануне
+• Возьмите с собой документы
+• Приходите вовремя
+
+Удачи! Ваш вклад спасет жизни! ❤️
+            """
+
+            # Отправляем и закрепляем сообщение
+            pinned_msg = await self.application.bot.send_message(
+                chat_id=donor_id,
+                text=donation_info
+            )
+            
+            try:
+                await self.application.bot.pin_chat_message(
+                    chat_id=donor_id,
+                    message_id=pinned_msg.message_id,
+                    disable_notification=True
+                )
+                logger.info(f"Сообщение о донации закреплено для донора {donor_id}")
+            except Exception as pin_error:
+                logger.error(f"Не удалось закрепить сообщение: {pin_error}")
+                # В личных чатах закрепление может не работать, это нормально
+            
+            # Уведомляем врача о новом отклике
+            if request_info and donor_info:
+                await self.notify_doctor_about_response(
+                    request_info['doctor_id'], 
+                    request_info, 
+                    donor_info,
+                    request_id
+                )
+            
+            logger.info(f"✅ Отклик донора {donor_id} на запрос {request_id} успешно сохранен")
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки отклика донора: {e}")
+            await query.edit_message_text(
+                "❌ Произошла ошибка при обработке отклика. Попробуйте позже."
+            )
+
+    async def notify_doctor_about_response(self, doctor_id: int, request_info, donor_info, request_id: int):
+        """Уведомляет врача о новом отклике донора"""
+        try:
+            # Подсчитываем общее количество откликов на этот запрос
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT COUNT(*) FROM donor_responses WHERE request_id = %s
+            """, (request_id,))
+            total_responses = cursor.fetchone()[0]
+            cursor.close()
+            conn.close()
+            
+            donor_name = donor_info['first_name']
+            if donor_info['last_name']:
+                donor_name += f" {donor_info['last_name']}"
+            
+            donor_username = f"@{donor_info['username']}" if donor_info['username'] else "нет username"
+            
+            message = f"""
+🎉 НОВЫЙ ОТКЛИК ДОНОРА!
+
+👤 Донор: {donor_name} ({donor_username})
+🩸 Группа крови: {donor_info['blood_type']}
+📍 Местоположение донора: {donor_info['location']}
+
+📋 Ваш запрос:
+🩸 Группа крови: {request_info['blood_type']}
+🏥 {request_info['hospital_name']}
+📍 {request_info['location']}
+📅 {request_info['request_date'].strftime('%d.%m.%Y')}
+
+📊 Всего откликов на этот запрос: {total_responses}
+
+Свяжитесь с донором для координации сдачи крови.
+            """
+            
+            await self.application.bot.send_message(
+                chat_id=doctor_id,
+                text=message
+            )
+            
+            logger.info(f"Уведомление о новом отклике отправлено врачу {doctor_id}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка отправки уведомления врачу: {e}")
 
     async def show_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показывает справку"""
