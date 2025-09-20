@@ -139,15 +139,24 @@ class BloodDonorBot:
 
         if query.data == "role_user":
             context.user_data['role'] = 'user'
+            # Сразу переходим к выбору группы крови через инлайн кнопки
+            keyboard = [
+                [InlineKeyboardButton("🩸 A+", callback_data="blood_A+"),
+                 InlineKeyboardButton("🩸 A-", callback_data="blood_A-")],
+                [InlineKeyboardButton("🩸 B+", callback_data="blood_B+"),
+                 InlineKeyboardButton("🩸 B-", callback_data="blood_B-")],
+                [InlineKeyboardButton("🩸 AB+", callback_data="blood_AB+"),
+                 InlineKeyboardButton("🩸 AB-", callback_data="blood_AB-")],
+                [InlineKeyboardButton("🩸 O+", callback_data="blood_O+"),
+                 InlineKeyboardButton("🩸 O-", callback_data="blood_O-")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(
                 "👤 Отлично! Вы выбрали роль донора.\n\n"
-                "Для регистрации вам нужно будет указать:\n"
-                "• Группу крови\n"
-                "• Местоположение\n"
-                "• Дату последней сдачи крови\n\n"
-                "Придумайте пароль для вашего аккаунта:"
+                "🩸 Выберите вашу группу крови:",
+                reply_markup=reply_markup
             )
-            return ENTERING_PASSWORD
+            return ENTERING_BLOOD_TYPE
         elif query.data == "role_doctor":
             context.user_data['role'] = 'doctor'
             await query.edit_message_text(
@@ -206,14 +215,27 @@ class BloodDonorBot:
             await update.message.reply_text("Произошла ошибка при регистрации.")
 
     async def handle_blood_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка ввода группы крови"""
-        blood_type = update.message.text.upper()
+        """Обработка выбора группы крови через инлайн кнопки"""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data.startswith('blood_'):
+            blood_type = query.data.replace('blood_', '')
+            context.user_data['blood_type'] = blood_type
+            
+            await query.edit_message_text(
+                f"✅ Группа крови {blood_type} выбрана!\n\n"
+                "📍 Теперь укажите ваше местоположение (город):"
+            )
+            return ENTERING_LOCATION
+        
+        # Для обратной совместимости - если кто-то введет текстом
+        blood_type = update.message.text.upper() if update.message else ""
         valid_types = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']
 
         if blood_type not in valid_types:
             await update.message.reply_text(
-                "❌ Неверный формат группы крови. Используйте формат: A+, B-, AB+, O- и т.д.\n"
-                "Попробуйте еще раз:"
+                "❌ Неверный формат группы крови. Используйте кнопки выше для выбора."
             )
             return ENTERING_BLOOD_TYPE
 
@@ -338,12 +360,16 @@ class BloodDonorBot:
             return USER_MENU
         elif query.data == "update_donation":
             await query.edit_message_text(
+                "📅 Обновление даты последней сдачи крови\n\n"
                 "Введите дату последней сдачи крови в формате ДД.ММ.ГГГГ\n"
                 "(или напишите 'никогда', если вы еще не сдавали кровь):"
             )
             return UPDATE_DONATION_DATE
         elif query.data == "update_location":
-            await query.edit_message_text("Введите новое местоположение (город):")
+            await query.edit_message_text(
+                "📍 Обновление местоположения\n\n"
+                "Введите новое местоположение (город):"
+            )
             return UPDATE_LOCATION
         elif query.data == "create_request":
             logger.info("Создание запроса крови")
@@ -357,7 +383,10 @@ class BloodDonorBot:
             return DOCTOR_MENU
         elif query.data == "help":
             await self.show_help(update, context)
-            return DOCTOR_MENU if self.is_doctor(update.effective_user.id) else USER_MENU
+            if self.is_doctor(update.effective_user.id):
+                return DOCTOR_MENU
+            else:
+                return USER_MENU
         elif query.data == "back_to_menu":
             user = update.effective_user
             try:
@@ -504,14 +533,14 @@ class BloodDonorBot:
         """Создание запроса на сдачу крови"""
         logger.info("Начинаем создание запроса крови")
         keyboard = [
-            [InlineKeyboardButton("A+", callback_data="blood_A+"),
-             InlineKeyboardButton("A-", callback_data="blood_A-")],
-            [InlineKeyboardButton("B+", callback_data="blood_B+"),
-             InlineKeyboardButton("B-", callback_data="blood_B-")],
-            [InlineKeyboardButton("AB+", callback_data="blood_AB+"),
-             InlineKeyboardButton("AB-", callback_data="blood_AB-")],
-            [InlineKeyboardButton("O+", callback_data="blood_O+"),
-             InlineKeyboardButton("O-", callback_data="blood_O-")],
+            [InlineKeyboardButton("A+", callback_data="request_A+"),
+             InlineKeyboardButton("A-", callback_data="request_A-")],
+            [InlineKeyboardButton("B+", callback_data="request_B+"),
+             InlineKeyboardButton("B-", callback_data="request_B-")],
+            [InlineKeyboardButton("AB+", callback_data="request_AB+"),
+             InlineKeyboardButton("AB-", callback_data="request_AB-")],
+            [InlineKeyboardButton("O+", callback_data="request_O+"),
+             InlineKeyboardButton("O-", callback_data="request_O-")],
             [InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -533,7 +562,7 @@ class BloodDonorBot:
             await self.show_doctor_menu(update, context)
             return DOCTOR_MENU
 
-        blood_type = query.data.replace('blood_', '')
+        blood_type = query.data.replace('request_', '')
         context.user_data['request_blood_type'] = blood_type
 
         logger.info(f"Выбрана группа крови для запроса: {blood_type}")
@@ -636,7 +665,10 @@ class BloodDonorBot:
             cursor = conn.cursor(cursor_factory=RealDictCursor)
 
             cursor.execute("""
-                SELECT * FROM donation_requests 
+                SELECT id, doctor_id, blood_type, location, 
+                       COALESCE(address, 'Адрес не указан') as address, 
+                       request_date, description, created_at 
+                FROM donation_requests 
                 WHERE doctor_id = %s 
                 ORDER BY created_at DESC 
                 LIMIT 10
@@ -706,7 +738,7 @@ class BloodDonorBot:
 
             # Последние 5 запросов
             cursor.execute("""
-                SELECT blood_type, location, address, request_date 
+                SELECT blood_type, location, COALESCE(address, 'Адрес не указан') as address, request_date 
                 FROM donation_requests 
                 ORDER BY created_at DESC 
                 LIMIT 5
@@ -832,7 +864,10 @@ class BloodDonorBot:
             states={
                 CHOOSING_ROLE: [CallbackQueryHandler(self.choose_role)],
                 ENTERING_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_password)],
-                ENTERING_BLOOD_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_blood_type)],
+                ENTERING_BLOOD_TYPE: [
+                    CallbackQueryHandler(self.handle_blood_type),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_blood_type)
+                ],
                 ENTERING_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_location)],
                 ENTERING_LAST_DONATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_last_donation)],
                 ENTERING_DONATION_REQUEST: [CallbackQueryHandler(self.handle_blood_type_request)],
