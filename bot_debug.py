@@ -34,7 +34,7 @@ class BloodDonorBot:
             'host': os.getenv('DB_HOST', 'localhost'),
             'database': os.getenv('DB_NAME', 'blood_donor_bot'),
             'user': os.getenv('DB_USER', 'postgres'),
-            'password': os.getenv('DB_PASSWORD', ''),
+            'password': os.getenv('DB_PASSWORD', 'vadamahjkl'),
             'port': os.getenv('DB_PORT', '5432')
         }
         self.application = None
