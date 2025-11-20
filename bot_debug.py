@@ -22,7 +22,8 @@ logger = logging.getLogger(__name__)
 CHOOSING_ROLE, ENTERING_PASSWORD, ENTERING_BLOOD_TYPE, ENTERING_LOCATION, \
     ENTERING_LAST_DONATION, USER_MENU, DOCTOR_MENU, ENTERING_DONATION_REQUEST, \
     ENTERING_REQUEST_LOCATION, ENTERING_REQUEST_ADDRESS, ENTERING_REQUEST_HOSPITAL, \
-    ENTERING_REQUEST_CONTACT, ENTERING_REQUEST_DATE, UPDATE_LOCATION, UPDATE_DONATION_DATE = range(15)
+    ENTERING_REQUEST_CONTACT, ENTERING_REQUEST_DATE, UPDATE_LOCATION, UPDATE_DONATION_DATE, \
+    UPDATE_BLOOD_TYPE = range(16)
 
 # Мастер-пароль для врачей
 MASTER_PASSWORD = "doctor2024"
@@ -138,6 +139,38 @@ class BloodDonorBot:
         logger.info(f"Пользователь {update.effective_user.id} выбрал роль: {query.data}")
 
         if query.data == "role_user":
+            # Проверяем, зарегистрирован ли уже пользователь (независимо от текущей роли в БД)
+            try:
+                conn = self.get_db_connection()
+                cursor = conn.cursor(cursor_factory=RealDictCursor)
+                # Ищем пользователя по ID, проверяем флаг регистрации и наличие данных донора
+                cursor.execute("""
+                    SELECT * FROM users 
+                    WHERE telegram_id = %s 
+                    AND is_registered = TRUE 
+                    AND blood_type IS NOT NULL 
+                    AND location IS NOT NULL
+                """, (update.effective_user.id,))
+                existing_user = cursor.fetchone()
+                
+                if existing_user:
+                    # Если пользователь существует и данные донора заполнены, обновляем роль и пускаем
+                    cursor.execute("UPDATE users SET role = 'user' WHERE telegram_id = %s", (update.effective_user.id,))
+                    conn.commit()
+                    
+                    cursor.close()
+                    conn.close()
+                    
+                    context.user_data['role'] = 'user'
+                    await query.edit_message_text("👋 С возвращением в режим донора!")
+                    await self.show_user_menu(update, context)
+                    return USER_MENU
+                
+                cursor.close()
+                conn.close()
+            except Exception as e:
+                logger.error(f"Ошибка проверки регистрации: {e}")
+
             context.user_data['role'] = 'user'
             # Сразу переходим к выбору группы крови через инлайн кнопки
             keyboard = [
@@ -158,6 +191,35 @@ class BloodDonorBot:
             )
             return ENTERING_BLOOD_TYPE
         elif query.data == "role_doctor":
+            # Проверяем, был ли пользователь уже врачом
+            try:
+                conn = self.get_db_connection()
+                cursor = conn.cursor(cursor_factory=RealDictCursor)
+                # Проверяем, был ли пользователь когда-либо зарегистрирован как врач
+                # Здесь мы предполагаем, что если is_registered=TRUE и он был врачом раньше, 
+                # или просто уже прошел проверку пароля ранее
+                # Но для безопасности лучше всегда спрашивать пароль при первом входе в сессию
+                # Однако, если пользователь просто переключается туда-сюда, можно упростить
+                
+                # В данном случае, следуя логике "если инфа есть - сразу вход",
+                # проверим, есть ли запись. Но для врача пароль все же важен.
+                # Если вы хотите пропускать пароль и для врача при повторном входе:
+                
+                cursor.execute("SELECT * FROM users WHERE telegram_id = %s AND role = 'doctor' AND is_registered = TRUE", 
+                             (update.effective_user.id,))
+                existing_doctor = cursor.fetchone()
+                cursor.close()
+                conn.close()
+                
+                if existing_doctor:
+                    context.user_data['role'] = 'doctor'
+                    await query.edit_message_text("👨‍⚕️ С возвращением в режим врача!")
+                    await self.show_doctor_menu(update, context)
+                    return DOCTOR_MENU
+                    
+            except Exception as e:
+                logger.error(f"Ошибка проверки врача: {e}")
+
             context.user_data['role'] = 'doctor'
             await query.edit_message_text(
                 "👨‍⚕️ Вы выбрали роль врача.\n\n"
@@ -311,8 +373,10 @@ class BloodDonorBot:
         keyboard = [
             [InlineKeyboardButton("📊 Моя информация", callback_data="user_info")],
             [InlineKeyboardButton("🩸 Мои донации", callback_data="my_donations")],
+            [InlineKeyboardButton("🩸 Изменить группу крови", callback_data="update_blood_type")],
             [InlineKeyboardButton("📅 Обновить дату сдачи", callback_data="update_donation")],
             [InlineKeyboardButton("📍 Изменить местоположение", callback_data="update_location")],
+            [InlineKeyboardButton("🔄 Сменить роль", callback_data="switch_role")],
             [InlineKeyboardButton("❓ Помощь", callback_data="help")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -335,6 +399,7 @@ class BloodDonorBot:
             [InlineKeyboardButton("📋 Мои запросы", callback_data="my_requests")],
             [InlineKeyboardButton("👥 Отклики доноров", callback_data="donor_responses")],
             [InlineKeyboardButton("📊 Статистика", callback_data="statistics")],
+            [InlineKeyboardButton("🔄 Сменить роль", callback_data="switch_role")],
             [InlineKeyboardButton("❓ Помощь", callback_data="help")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -363,6 +428,24 @@ class BloodDonorBot:
         elif query.data == "my_donations":
             await self.show_my_donations(update, context)
             return USER_MENU
+        elif query.data == "update_blood_type":
+            keyboard = [
+                [InlineKeyboardButton("🩸 A+", callback_data="blood_A+"),
+                 InlineKeyboardButton("🩸 A-", callback_data="blood_A-")],
+                [InlineKeyboardButton("🩸 B+", callback_data="blood_B+"),
+                 InlineKeyboardButton("🩸 B-", callback_data="blood_B-")],
+                [InlineKeyboardButton("🩸 AB+", callback_data="blood_AB+"),
+                 InlineKeyboardButton("🩸 AB-", callback_data="blood_AB-")],
+                [InlineKeyboardButton("🩸 O+", callback_data="blood_O+"),
+                 InlineKeyboardButton("🩸 O-", callback_data="blood_O-")],
+                [InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                "🩸 Выберите новую группу крови:",
+                reply_markup=reply_markup
+            )
+            return UPDATE_BLOOD_TYPE
         elif query.data == "update_donation":
             await query.edit_message_text(
                 "📅 Обновление даты последней сдачи крови\n\n"
@@ -376,6 +459,19 @@ class BloodDonorBot:
                 "Введите новое местоположение (город):"
             )
             return UPDATE_LOCATION
+        elif query.data == "switch_role":
+            # Возвращаемся к выбору роли
+            keyboard = [
+                [InlineKeyboardButton("👤 Я донор", callback_data="role_user")],
+                [InlineKeyboardButton("👨‍⚕️ Я врач", callback_data="role_doctor")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                "👋 Выберите вашу роль:",
+                reply_markup=reply_markup
+            )
+            return CHOOSING_ROLE
         elif query.data == "create_request":
             logger.info("Создание запроса крови")
             await self.create_donation_request(update, context)
@@ -389,6 +485,19 @@ class BloodDonorBot:
         elif query.data == "statistics":
             await self.show_statistics(update, context)
             return DOCTOR_MENU
+        elif query.data == "switch_role":
+            # Возвращаемся к выбору роли
+            keyboard = [
+                [InlineKeyboardButton("👤 Я донор", callback_data="role_user")],
+                [InlineKeyboardButton("👨‍⚕️ Я врач", callback_data="role_doctor")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                "👋 Выберите вашу роль:",
+                reply_markup=reply_markup
+            )
+            return CHOOSING_ROLE
         elif query.data == "help":
             await self.show_help(update, context)
             if self.is_doctor(update.effective_user.id):
@@ -754,6 +863,43 @@ class BloodDonorBot:
             logger.error(f"Ошибка сохранения запроса в БД: {e}")
             await update.message.reply_text("Произошла ошибка при создании запроса. Попробуйте позже.")
             return DOCTOR_MENU
+
+    async def process_update_blood_type(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка обновления группы крови"""
+        query = update.callback_query
+        await query.answer()
+
+        if query.data == "back_to_menu":
+            await self.show_user_menu(update, context)
+            return USER_MENU
+
+        if query.data.startswith('blood_'):
+            blood_type = query.data.replace('blood_', '')
+            user = update.effective_user
+            
+            try:
+                conn = self.get_db_connection()
+                cursor = conn.cursor()
+                
+                cursor.execute("""
+                    UPDATE users 
+                    SET blood_type = %s 
+                    WHERE telegram_id = %s
+                """, (blood_type, user.id))
+                
+                conn.commit()
+                cursor.close()
+                conn.close()
+                
+                await query.edit_message_text(f"✅ Группа крови успешно обновлена на {blood_type}!")
+                await self.show_user_menu(update, context)
+                return USER_MENU
+            except Exception as e:
+                logger.error(f"Ошибка обновления группы крови: {e}")
+                await query.edit_message_text("Произошла ошибка при обновлении группы крови.")
+                return USER_MENU
+        
+        return UPDATE_BLOOD_TYPE
 
     async def show_my_requests(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показывает запросы врача"""
@@ -1271,7 +1417,8 @@ class BloodDonorBot:
                 USER_MENU: [CallbackQueryHandler(self.handle_menu_callback)],
                 DOCTOR_MENU: [CallbackQueryHandler(self.handle_menu_callback)],
                 UPDATE_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.update_location)],
-                UPDATE_DONATION_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.update_donation_date)]
+                UPDATE_DONATION_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.update_donation_date)],
+                UPDATE_BLOOD_TYPE: [CallbackQueryHandler(self.process_update_blood_type)]
             },
             fallbacks=[CommandHandler('start', self.start)]
         )
