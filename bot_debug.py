@@ -749,8 +749,7 @@ class BloodDonorBot:
             await self.handle_user_app_action(update, context)
             return USER_MENU
         elif query.data == "edit_mc_info":
-            await self.show_edit_mc_menu(update, context)
-            return MC_MENU
+            return await self.show_edit_mc_menu(update, context)
         elif query.data == "want_to_donate":
             await self.start_donation_search(update, context)
             return DONOR_SEARCH_MC
