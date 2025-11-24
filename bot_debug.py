@@ -1,6 +1,8 @@
 import os
 import logging
-from datetime import datetime, timedelta
+import hashlib
+import math
+from datetime import datetime, timedelta, date
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, \
     ConversationHandler
@@ -23,7 +25,10 @@ CHOOSING_ROLE, ENTERING_PASSWORD, ENTERING_BLOOD_TYPE, ENTERING_LOCATION, \
     ENTERING_LAST_DONATION, USER_MENU, DOCTOR_MENU, ENTERING_DONATION_REQUEST, \
     ENTERING_REQUEST_LOCATION, ENTERING_REQUEST_ADDRESS, ENTERING_REQUEST_HOSPITAL, \
     ENTERING_REQUEST_CONTACT, ENTERING_REQUEST_DATE, UPDATE_LOCATION, UPDATE_DONATION_DATE, \
-    UPDATE_BLOOD_TYPE = range(16)
+    UPDATE_BLOOD_TYPE, MC_AUTH_MENU, MC_REGISTER_NAME, MC_REGISTER_ADDRESS, \
+    MC_REGISTER_CITY, MC_REGISTER_LOGIN, MC_REGISTER_PASSWORD, MC_LOGIN_LOGIN, \
+    MC_LOGIN_PASSWORD, MC_MENU, MANAGE_BLOOD_NEEDS, DONOR_CERT_UPLOAD, \
+    DONOR_SEARCH_MC, MC_EDIT_INFO, MC_EDIT_INPUT = range(30)
 
 # Мастер-пароль для врачей
 MASTER_PASSWORD = "doctor2024"
@@ -41,6 +46,27 @@ class BloodDonorBot:
         self.application = None
         self.init_database()
 
+    def calculate_distance(self, lat1, lon1, lat2, lon2):
+        """
+        Вычисляет расстояние между двумя точками (в км) по формуле гаверсинуса
+        """
+        if not lat1 or not lon1 or not lat2 or not lon2:
+            return None
+
+        R = 6371  # Радиус Земли в км
+
+        d_lat = math.radians(lat2 - lat1)
+        d_lon = math.radians(lon2 - lon1)
+        
+        a = (math.sin(d_lat / 2) * math.sin(d_lat / 2) +
+             math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+             math.sin(d_lon / 2) * math.sin(d_lon / 2))
+        
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        
+        d = R * c
+        return d
+
     def get_db_connection(self):
         """Создает соединение с базой данных"""
         return psycopg2.connect(**self.db_config)
@@ -51,7 +77,7 @@ class BloodDonorBot:
             conn = self.get_db_connection()
             cursor = conn.cursor()
 
-            # Создание таблиц
+            # Создание таблицы пользователей
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
@@ -68,6 +94,67 @@ class BloodDonorBot:
                 )
             """)
 
+            # Обновление таблицы users (новые колонки)
+            alter_commands = [
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS city VARCHAR(100)",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS latitude FLOAT",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS longitude FLOAT",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS medical_certificate_file_id VARCHAR(255)",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS medical_certificate_date DATE",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_number VARCHAR(20)",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS medical_center_id INTEGER REFERENCES medical_centers(id)"
+            ]
+            for cmd in alter_commands:
+                try:
+                    cursor.execute(cmd)
+                except psycopg2.errors.DuplicateColumn:
+                    conn.rollback()
+                except Exception as e:
+                    logger.warning(f"Alter table warning: {e}")
+                    conn.rollback()
+                else:
+                    conn.commit()
+
+            # Создание таблицы медицинских центров
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS medical_centers (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    address VARCHAR(255) NOT NULL,
+                    city VARCHAR(100) NOT NULL,
+                    latitude FLOAT,
+                    longitude FLOAT,
+                    login VARCHAR(50) UNIQUE NOT NULL,
+                    password_hash VARCHAR(255) NOT NULL,
+                    contact_info TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Создание таблицы потребностей крови
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS blood_needs (
+                    id SERIAL PRIMARY KEY,
+                    medical_center_id INTEGER REFERENCES medical_centers(id),
+                    blood_type VARCHAR(10) NOT NULL,
+                    status VARCHAR(20) DEFAULT 'ok',
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(medical_center_id, blood_type)
+                )
+            """)
+
+            # Таблица откликов доноров
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS donation_responses (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT REFERENCES users(telegram_id),
+                    medical_center_id INTEGER REFERENCES medical_centers(id),
+                    status VARCHAR(20) DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Старая таблица запросов (оставляем для совместимости или истории)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS donation_requests (
                     id SERIAL PRIMARY KEY,
@@ -234,8 +321,8 @@ class BloodDonorBot:
 
         if context.user_data['role'] == 'doctor':
             if password == MASTER_PASSWORD:
-                await self.register_doctor(update, context)
-                return DOCTOR_MENU
+                await self.show_mc_auth_menu(update, context)
+                return MC_AUTH_MENU
             else:
                 await update.message.reply_text(
                     "❌ Неверный мастер-пароль. Попробуйте еще раз:"
@@ -249,6 +336,184 @@ class BloodDonorBot:
                 "Теперь укажите вашу группу крови (например: A+, B-, AB+, O-):"
             )
             return ENTERING_BLOOD_TYPE
+
+    async def show_mc_auth_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает меню выбора входа/регистрации медцентра"""
+        keyboard = [
+            [InlineKeyboardButton("🏥 Войти в медцентр", callback_data="login_mc")],
+            [InlineKeyboardButton("📝 Зарегистрировать новый центр", callback_data="register_mc")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_role")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        msg = "Добро пожаловать в систему управления донорством.\nВыберите действие:"
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(msg, reply_markup=reply_markup)
+
+    async def handle_mc_auth_choice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка выбора в меню авторизации МЦ"""
+        query = update.callback_query
+        await query.answer()
+        choice = query.data
+
+        if choice == "login_mc":
+            await query.edit_message_text("🔑 Введите логин вашего медицинского центра:")
+            return MC_LOGIN_LOGIN
+        elif choice == "register_mc":
+            await query.edit_message_text("🏥 Введите название вашего медицинского центра:")
+            return MC_REGISTER_NAME
+        elif choice == "back_to_role":
+            await self.show_role_choice(update, context)
+            return CHOOSING_ROLE
+        return MC_AUTH_MENU
+
+    # --- REGISTRATION FLOW ---
+    async def process_mc_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data['reg_mc_name'] = update.message.text
+        await update.message.reply_text("📍 Введите адрес медицинского центра:")
+        return MC_REGISTER_ADDRESS
+
+    async def process_mc_address(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data['reg_mc_address'] = update.message.text
+        await update.message.reply_text(
+            "📍 Отправьте геолокацию центра (скрепка -> Геопозиция).\n"
+            "Это позволит донорам находить вас на карте.\n"
+            "Если не можете, просто напишите название города:"
+        )
+        return MC_REGISTER_CITY
+    
+    async def process_mc_city(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        latitude = None
+        longitude = None
+        city = None
+
+        if update.message.location:
+            loc = update.message.location
+            latitude = loc.latitude
+            longitude = loc.longitude
+            city = f"Координаты {latitude:.4f}, {longitude:.4f}" # Temporary city name if coords
+            # Ideally we would reverse geocode here to get city name
+            context.user_data['reg_mc_latitude'] = latitude
+            context.user_data['reg_mc_longitude'] = longitude
+        else:
+            city = update.message.text
+            context.user_data['reg_mc_latitude'] = None
+            context.user_data['reg_mc_longitude'] = None
+
+        context.user_data['reg_mc_city'] = city
+        await update.message.reply_text("👤 Придумайте логин для входа:")
+        return MC_REGISTER_LOGIN
+
+    async def process_mc_reg_login(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        login = update.message.text
+        # Check uniqueness
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM medical_centers WHERE login = %s", (login,))
+        exists = cursor.fetchone()
+        cursor.close()
+        conn.close()
+
+        if exists:
+            await update.message.reply_text("❌ Такой логин уже занят. Придумайте другой:")
+            return MC_REGISTER_LOGIN
+
+        context.user_data['reg_mc_login'] = login
+        await update.message.reply_text("🔒 Придумайте пароль:")
+        return MC_REGISTER_PASSWORD
+
+    async def process_mc_reg_password(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        password = update.message.text
+        # Hash password
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
+        
+        data = context.user_data
+        try:
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                INSERT INTO medical_centers (name, address, city, latitude, longitude, login, password_hash)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (data['reg_mc_name'], data['reg_mc_address'], data['reg_mc_city'], 
+                  data.get('reg_mc_latitude'), data.get('reg_mc_longitude'),
+                  data['reg_mc_login'], password_hash))
+            
+            mc_id = cursor.fetchone()[0]
+            
+            # Ensure user is registered as doctor and linked to MC
+            user = update.effective_user
+            cursor.execute("""
+                INSERT INTO users (telegram_id, username, first_name, last_name, role, is_registered, medical_center_id)
+                VALUES (%s, %s, %s, %s, 'doctor', TRUE, %s)
+                ON CONFLICT (telegram_id) 
+                DO UPDATE SET role = 'doctor', is_registered = TRUE, medical_center_id = EXCLUDED.medical_center_id
+            """, (user.id, user.username, user.first_name, user.last_name, mc_id))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+            context.user_data['mc_id'] = mc_id
+            # Load info for session
+            context.user_data['mc_info'] = {
+                'id': mc_id, 'name': data['reg_mc_name'], 'address': data['reg_mc_address'],
+                'city': data['reg_mc_city']
+            }
+            await update.message.reply_text("✅ Медицинский центр успешно зарегистрирован!")
+            await self.show_doctor_menu(update, context) 
+            return MC_MENU
+        except Exception as e:
+            logger.error(f"Registration error: {e}")
+            await update.message.reply_text("❌ Ошибка регистрации. Попробуйте снова /start")
+            return ConversationHandler.END
+
+    # --- LOGIN FLOW ---
+    async def process_mc_login_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data['login_mc_login'] = update.message.text
+        await update.message.reply_text("🔒 Введите пароль:")
+        return MC_LOGIN_PASSWORD
+
+    async def process_mc_login_password(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        password = update.message.text
+        login = context.user_data.get('login_mc_login')
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
+
+        conn = self.get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT * FROM medical_centers WHERE login = %s AND password_hash = %s", 
+                       (login, password_hash))
+        mc = cursor.fetchone()
+        cursor.close()
+        
+        if mc:
+            context.user_data['mc_id'] = mc['id']
+            context.user_data['mc_info'] = mc
+            
+            # Update user role to doctor and link to MC
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+            user = update.effective_user
+            cursor.execute("""
+                INSERT INTO users (telegram_id, username, first_name, last_name, role, is_registered, medical_center_id)
+                VALUES (%s, %s, %s, %s, 'doctor', TRUE, %s)
+                ON CONFLICT (telegram_id) 
+                DO UPDATE SET role = 'doctor', is_registered = TRUE, medical_center_id = EXCLUDED.medical_center_id
+            """, (user.id, user.username, user.first_name, user.last_name, mc['id']))
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+            await update.message.reply_text(f"✅ Вход выполнен: {mc['name']}")
+            await self.show_doctor_menu(update, context)
+            return MC_MENU
+        else:
+            conn.close()
+            await update.message.reply_text("❌ Неверный логин или пароль. Попробуйте снова логин:")
+            return MC_LOGIN_LOGIN
 
     async def register_doctor(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Регистрация врача"""
@@ -304,14 +569,24 @@ class BloodDonorBot:
         context.user_data['blood_type'] = blood_type
         await update.message.reply_text(
             "✅ Группа крови сохранена!\n\n"
-            "Теперь укажите ваше местоположение (город):"
+            "📍 Теперь укажите ваше местоположение.\n"
+            "Отправьте геопозицию (скрепка -> Геопозиция) или напишите название города:"
         )
         return ENTERING_LOCATION
 
     async def handle_location(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка ввода местоположения"""
-        location = update.message.text
-        context.user_data['location'] = location
+        if update.message.location:
+            location = update.message.location
+            context.user_data['latitude'] = location.latitude
+            context.user_data['longitude'] = location.longitude
+            context.user_data['location'] = f"Координаты: {location.latitude:.4f}, {location.longitude:.4f}"
+            await update.message.reply_text("✅ Геопозиция получена!")
+        else:
+            location_text = update.message.text
+            context.user_data['location'] = location_text
+            context.user_data['latitude'] = None
+            context.user_data['longitude'] = None
 
         await update.message.reply_text(
             "✅ Местоположение сохранено!\n\n"
@@ -344,15 +619,21 @@ class BloodDonorBot:
 
             cursor.execute("""
                 INSERT INTO users (telegram_id, username, first_name, last_name, role, 
-                                 blood_type, location, last_donation_date, is_registered)
-                VALUES (%s, %s, %s, %s, 'user', %s, %s, %s, TRUE)
+                                 blood_type, location, latitude, longitude, last_donation_date, is_registered)
+                VALUES (%s, %s, %s, %s, 'user', %s, %s, %s, %s, %s, TRUE)
                 ON CONFLICT (telegram_id) 
                 DO UPDATE SET blood_type = EXCLUDED.blood_type, 
                              location = EXCLUDED.location, 
+                             latitude = EXCLUDED.latitude,
+                             longitude = EXCLUDED.longitude,
                              last_donation_date = EXCLUDED.last_donation_date,
                              is_registered = TRUE
             """, (user.id, user.username, user.first_name, user.last_name,
-                  context.user_data['blood_type'], context.user_data['location'], last_donation_date))
+                  context.user_data.get('blood_type'), 
+                  context.user_data.get('location'),
+                  context.user_data.get('latitude'),
+                  context.user_data.get('longitude'),
+                  last_donation_date))
 
             conn.commit()
             cursor.close()
@@ -371,6 +652,8 @@ class BloodDonorBot:
     async def show_user_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показывает меню пользователя"""
         keyboard = [
+            [InlineKeyboardButton("💉 Хочу сдать кровь", callback_data="want_to_donate")],
+            [InlineKeyboardButton("📄 Мед. справка", callback_data="my_certs")],
             [InlineKeyboardButton("📊 Моя информация", callback_data="user_info")],
             [InlineKeyboardButton("🩸 Мои донации", callback_data="my_donations")],
             [InlineKeyboardButton("🩸 Изменить группу крови", callback_data="update_blood_type")],
@@ -394,24 +677,61 @@ class BloodDonorBot:
 
     async def show_doctor_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показывает меню врача"""
+        mc_name = "Неизвестный МЦ"
+        
+        # Try to get from context
+        if context.user_data.get('mc_info'):
+            mc_name = context.user_data['mc_info'].get('name', mc_name)
+        else:
+            # Try to restore from DB if logged in as doctor
+            user_id = update.effective_user.id
+            conn = self.get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            # Check if user is linked to an MC (via login or registration)
+            # We need to store this link. For now, let's assume we check user role and try to find last MC?
+            # Or better, rely on `mc_id` in `context.user_data` which should be set on login.
+            # If it's missing (restart), we might need to re-login or infer from `users` table if we added `medical_center_id` there.
+            
+            # Let's use the new column we added to `users` table
+            cursor.execute("""
+                SELECT mc.id, mc.name, mc.address, mc.city, mc.contact_info 
+                FROM users u
+                JOIN medical_centers mc ON u.medical_center_id = mc.id
+                WHERE u.telegram_id = %s
+            """, (user_id,))
+            
+            mc = cursor.fetchone()
+            if mc:
+                context.user_data['mc_id'] = mc['id']
+                context.user_data['mc_info'] = mc
+                mc_name = mc['name']
+            
+            cursor.close()
+            conn.close()
+
         keyboard = [
-            [InlineKeyboardButton("🩸 Создать запрос крови", callback_data="create_request")],
-            [InlineKeyboardButton("📋 Мои запросы", callback_data="my_requests")],
+            [InlineKeyboardButton("🚦 Донорский светофор", callback_data="traffic_light")],
             [InlineKeyboardButton("👥 Отклики доноров", callback_data="donor_responses")],
+            [InlineKeyboardButton("✏️ Редактировать МЦ", callback_data="edit_mc_info")],
+            [InlineKeyboardButton("🩸 Создать запрос (дата)", callback_data="create_request")],
+            [InlineKeyboardButton("📋 Мои запросы", callback_data="my_requests")],
             [InlineKeyboardButton("📊 Статистика", callback_data="statistics")],
             [InlineKeyboardButton("🔄 Сменить роль", callback_data="switch_role")],
             [InlineKeyboardButton("❓ Помощь", callback_data="help")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
+        text = f"👨‍⚕️ Меню врача\n🏥 Центр: {mc_name}\n\nВыберите действие:"
+
         if update.callback_query:
             await update.callback_query.edit_message_text(
-                "👨‍⚕️ Меню врача\n\nВыберите действие:",
+                text,
                 reply_markup=reply_markup
             )
         else:
             await update.message.reply_text(
-                "👨‍⚕️ Меню врача\n\nВыберите действие:",
+                text,
                 reply_markup=reply_markup
             )
 
@@ -425,6 +745,18 @@ class BloodDonorBot:
         if query.data == "user_info":
             await self.show_user_info(update, context)
             return USER_MENU
+        elif query.data.startswith("cancel_app_"):
+            await self.handle_user_app_action(update, context)
+            return USER_MENU
+        elif query.data == "edit_mc_info":
+            await self.show_edit_mc_menu(update, context)
+            return MC_MENU
+        elif query.data == "want_to_donate":
+            await self.start_donation_search(update, context)
+            return DONOR_SEARCH_MC
+        elif query.data == "my_certs":
+            await self.show_cert_menu(update, context)
+            return DONOR_CERT_UPLOAD
         elif query.data == "my_donations":
             await self.show_my_donations(update, context)
             return USER_MENU
@@ -456,7 +788,7 @@ class BloodDonorBot:
         elif query.data == "update_location":
             await query.edit_message_text(
                 "📍 Обновление местоположения\n\n"
-                "Введите новое местоположение (город):"
+                "Отправьте новую геопозицию (скрепка -> Геопозиция) или введите название города:"
             )
             return UPDATE_LOCATION
         elif query.data == "switch_role":
@@ -472,6 +804,9 @@ class BloodDonorBot:
                 reply_markup=reply_markup
             )
             return CHOOSING_ROLE
+        elif query.data == "traffic_light":
+             await self.show_traffic_light(update, context)
+             return MANAGE_BLOOD_NEEDS
         elif query.data == "create_request":
             logger.info("Создание запроса крови")
             await self.create_donation_request(update, context)
@@ -480,8 +815,11 @@ class BloodDonorBot:
             await self.show_my_requests(update, context)
             return DOCTOR_MENU
         elif query.data == "donor_responses":
-            await self.show_donor_responses(update, context)
-            return DOCTOR_MENU
+            await self.show_donor_responses_v2(update, context)
+            return MC_MENU
+        elif query.data.startswith("view_donor_") or query.data.startswith("confirm_donation_") or query.data.startswith("reject_donation_"):
+             await self.handle_donor_response_action(update, context)
+             return MC_MENU
         elif query.data == "statistics":
             await self.show_statistics(update, context)
             return DOCTOR_MENU
@@ -529,6 +867,493 @@ class BloodDonorBot:
             except Exception as e:
                 logger.error(f"Ошибка при возврате в меню: {e}")
                 return CHOOSING_ROLE
+
+    # --- TRAFFIC LIGHT (DOCTOR) ---
+    async def show_traffic_light(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        mc_id = context.user_data.get('mc_id')
+        if not mc_id:
+            if update.callback_query:
+                await update.callback_query.answer("Ошибка: МЦ не выбран")
+            return MC_MENU
+
+        conn = self.get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT blood_type, status FROM blood_needs WHERE medical_center_id = %s", (mc_id,))
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        # Default statuses if not found
+        status_map = {row['blood_type']: row['status'] for row in rows}
+        blood_types = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']
+        
+        # Status emojis
+        emojis = {'ok': '🟢', 'need': '🟡', 'urgent': '🔴'}
+        
+        keyboard = []
+        row = []
+        for bt in blood_types:
+            status = status_map.get(bt, 'ok')
+            btn_text = f"{bt} {emojis[status]}"
+            row.append(InlineKeyboardButton(btn_text, callback_data=f"tl_toggle_{bt}"))
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        
+        keyboard.append([InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        msg = "🚦 **Донорский светофор**\n\nНажимайте на группу крови, чтобы изменить статус:\n🟢 Достаточно\n🟡 Нужно пополнить\n🔴 Срочно (Агрессивный поиск)"
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
+
+    async def handle_traffic_light_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+        
+        if data == "back_to_menu":
+            await self.show_doctor_menu(update, context)
+            return MC_MENU
+            
+        if data.startswith("tl_toggle_"):
+            blood_type = data.replace("tl_toggle_", "")
+            mc_id = context.user_data.get('mc_id')
+            
+            if not mc_id:
+                # Recovery attempt
+                conn = self.get_db_connection()
+                cursor = conn.cursor(cursor_factory=RealDictCursor)
+                cursor.execute("SELECT id, name FROM medical_centers WHERE doctor_id = %s", (update.effective_user.id,))
+                mc = cursor.fetchone()
+                cursor.close()
+                conn.close()
+                if mc:
+                    context.user_data['mc_id'] = mc['id']
+                    context.user_data['mc_info'] = mc
+                    mc_id = mc['id']
+                else:
+                     await query.edit_message_text("❌ Ошибка сессии. Пожалуйста, перезайдите в меню МЦ.")
+                     return DOCTOR_MENU
+            
+            conn = self.get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            # Get current
+            cursor.execute("SELECT status FROM blood_needs WHERE medical_center_id = %s AND blood_type = %s", 
+                           (mc_id, blood_type))
+            row = cursor.fetchone()
+            
+            current = row['status'] if row else 'ok'
+            # Cycle: ok -> need -> urgent -> ok
+            next_status = {'ok': 'need', 'need': 'urgent', 'urgent': 'ok'}[current]
+            
+            # Upsert
+            cursor.execute("""
+                INSERT INTO blood_needs (medical_center_id, blood_type, status)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (medical_center_id, blood_type) 
+                DO UPDATE SET status = %s
+            """, (mc_id, blood_type, next_status, next_status))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            if next_status == 'urgent':
+                await self.broadcast_need(mc_id, blood_type)
+
+            # Refresh view
+            await self.show_traffic_light(update, context)
+            return MANAGE_BLOOD_NEEDS
+        return MANAGE_BLOOD_NEEDS
+
+    # --- DONOR CERTIFICATES ---
+    async def show_cert_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        
+        # Check expiration
+        was_expired = self.check_cert_expiration(user_id)
+        
+        conn = self.get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT medical_certificate_date FROM users WHERE telegram_id = %s", (user_id,))
+        user = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        cert_date = user.get('medical_certificate_date')
+        msg = "📄 **Медицинская справка**\n\n"
+        
+        if was_expired:
+             msg += "⚠️ **Ваша предыдущая справка истекла и была удалена.**\nПожалуйста, загрузите новую.\n\n"
+        
+        if cert_date:
+            days_passed = (date.today() - cert_date).days
+            validity = 180 # 6 months
+            msg += f"✅ Справка активна (загружена {cert_date.strftime('%d.%m.%Y')})\n"
+            msg += f"Действительна еще {validity - days_passed} дней."
+        else:
+            msg += "❌ Справка не загружена.\nЗагрузите фото справки, чтобы врачи могли видеть ваш статус."
+            
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg + "\n\nОтправьте фото справки в этот чат для загрузки.", reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            await update.message.reply_text(msg + "\n\nОтправьте фото справки в этот чат для загрузки.", reply_markup=reply_markup, parse_mode='Markdown')
+
+    async def process_cert_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.message.photo:
+             await update.message.reply_text("Пожалуйста, отправьте фото.")
+             return DONOR_CERT_UPLOAD
+
+        photo = update.message.photo[-1]
+        file_id = photo.file_id
+        user_id = update.effective_user.id
+        
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE users 
+            SET medical_certificate_file_id = %s, medical_certificate_date = CURRENT_DATE
+            WHERE telegram_id = %s
+        """, (file_id, user_id))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        await update.message.reply_text("✅ Справка успешно загружена/обновлена!")
+        await self.show_user_menu(update, context)
+        return USER_MENU
+
+    async def handle_cert_menu_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        if query.data == "back_to_menu":
+             await self.show_user_menu(update, context)
+             return USER_MENU
+        return DONOR_CERT_UPLOAD
+
+    def check_cert_expiration(self, user_id):
+        """Проверяет и удаляет просроченную справку"""
+        conn = self.get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT medical_certificate_date FROM users WHERE telegram_id = %s", (user_id,))
+        user = cursor.fetchone()
+        
+        if user and user['medical_certificate_date']:
+            cert_date = user['medical_certificate_date']
+            days_passed = (date.today() - cert_date).days
+            validity = 180 # 6 months
+            
+            if days_passed >= validity:
+                cursor.execute("""
+                    UPDATE users 
+                    SET medical_certificate_file_id = NULL, medical_certificate_date = NULL 
+                    WHERE telegram_id = %s
+                """, (user_id,))
+                conn.commit()
+                cursor.close()
+                conn.close()
+                return True # Expired and deleted
+                
+        cursor.close()
+        conn.close()
+        return False # Valid or not present
+
+    # --- DONOR SEARCH ---
+    async def start_donation_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        conn = self.get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT blood_type, city, latitude, longitude FROM users WHERE telegram_id = %s", (user_id,))
+        user = cursor.fetchone()
+        
+        if not user or not user['blood_type']:
+            if update.callback_query:
+                await update.callback_query.answer("Сначала укажите группу крови!")
+            return USER_MENU
+
+        # Find MCs with need
+        cursor.execute("""
+            SELECT mc.id, mc.name, mc.address, mc.city, bn.status, mc.latitude, mc.longitude
+            FROM blood_needs bn
+            JOIN medical_centers mc ON bn.medical_center_id = mc.id
+            WHERE bn.blood_type = %s AND bn.status IN ('need', 'urgent')
+        """, (user['blood_type'],))
+        mcs = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        if not mcs:
+            if update.callback_query:
+                await update.callback_query.edit_message_text("😔 К сожалению, сейчас нет запросов на вашу группу крови.")
+            return USER_MENU
+            
+        # Calculate distances and sort
+        user_lat = user['latitude']
+        user_lon = user['longitude']
+        
+        valid_mcs = []
+        for mc in mcs:
+            dist = self.calculate_distance(user_lat, user_lon, mc['latitude'], mc['longitude'])
+            mc['distance'] = dist
+            # Filter by radius (e.g., 50km) if user has coords AND mc has coords
+            if user_lat and mc['latitude']:
+                 if dist <= 50: # 50km radius
+                     valid_mcs.append(mc)
+            else:
+                # If no coords, show all matching by city or just show all?
+                # Let's show all but maybe mark them
+                valid_mcs.append(mc)
+
+        # Sort by distance (None last)
+        valid_mcs.sort(key=lambda x: x['distance'] if x['distance'] is not None else 9999)
+        
+        if not valid_mcs:
+             if update.callback_query:
+                 keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]]
+                 await update.callback_query.edit_message_text("😔 В радиусе 50км нет запросов на вашу группу крови.", reply_markup=InlineKeyboardMarkup(keyboard))
+             return USER_MENU
+
+        msg = f"🔎 Найдены центры, нуждающиеся в {user['blood_type']}:\n\n"
+        keyboard = []
+        
+        for mc in valid_mcs[:10]: # Show top 10
+            icon = "🔴" if mc['status'] == 'urgent' else "🟡"
+            dist_str = f"{mc['distance']:.1f}км" if mc['distance'] is not None else mc['city']
+            btn_text = f"{icon} {mc['name']} ({dist_str})"
+            keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"view_mc_{mc['id']}")])
+            
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.callback_query.edit_message_text(msg, reply_markup=reply_markup)
+        return DONOR_SEARCH_MC
+        
+    async def handle_donation_search_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+        
+        if data == "back_to_menu":
+            await self.show_user_menu(update, context)
+            return USER_MENU
+            
+        if data == "want_to_donate":
+             await self.start_donation_search(update, context)
+             return DONOR_SEARCH_MC
+
+        if data.startswith("view_mc_"):
+            mc_id = int(data.replace("view_mc_", ""))
+            conn = self.get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute("SELECT * FROM medical_centers WHERE id = %s", (mc_id,))
+            mc = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            
+            msg = f"🏥 **{mc['name']}**\n"
+            msg += f"📍 {mc['address']}\n"
+            msg += f"🏙 {mc['city']}\n"
+            msg += f"📞 {mc['contact_info'] or 'Нет контактов'}\n\n"
+            msg += "Вы готовы сдать кровь в этом центре?"
+            
+            keyboard = [
+                [InlineKeyboardButton("✅ Согласен на донацию", callback_data=f"agree_donate_{mc_id}")],
+                [InlineKeyboardButton("🔙 К списку", callback_data="want_to_donate")] 
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(msg, reply_markup=reply_markup, parse_mode='Markdown')
+            return DONOR_SEARCH_MC
+
+        if data.startswith("agree_donate_"):
+            # Check cert expiration first
+            self.check_cert_expiration(update.effective_user.id)
+            
+            mc_id = int(data.replace("agree_donate_", ""))
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO donation_responses (user_id, medical_center_id, status)
+                VALUES (%s, %s, 'pending')
+            """, (update.effective_user.id, mc_id))
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            await update.callback_query.edit_message_text("✅ Спасибо! Ваша заявка отправлена врачу. Ждите подтверждения.")
+            await self.show_user_menu(update, context)
+            return USER_MENU
+        
+        return DONOR_SEARCH_MC
+
+    async def show_donor_responses_v2(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает отклики доноров (New Implementation)"""
+        mc_id = context.user_data.get('mc_id')
+        if not mc_id:
+            if update.callback_query:
+                await update.callback_query.answer("Ошибка: МЦ не выбран")
+            return MC_MENU
+
+        conn = self.get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        cursor.execute("""
+            SELECT dr.id, dr.created_at, u.telegram_id, u.first_name, u.last_name, u.username, 
+                   u.blood_type, u.medical_certificate_file_id, u.medical_certificate_date
+            FROM donation_responses dr
+            JOIN users u ON dr.user_id = u.telegram_id
+            WHERE dr.medical_center_id = %s AND dr.status = 'pending'
+            ORDER BY dr.created_at DESC
+        """, (mc_id,))
+        
+        responses = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        if not responses:
+            msg = "👥 Пока нет новых откликов доноров."
+            if update.callback_query:
+                await update.callback_query.edit_message_text(
+                    msg,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")]])
+                )
+            return MC_MENU
+            
+        keyboard = []
+        for r in responses:
+            name = f"{r['first_name']} {r['last_name'] or ''} ({r['blood_type']})"
+            keyboard.append([InlineKeyboardButton(name, callback_data=f"view_donor_{r['id']}")])
+            
+        keyboard.append([InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")])
+        
+        await update.callback_query.edit_message_text(
+            f"👥 Найдено {len(responses)} откликов. Выберите донора для просмотра:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return MC_MENU 
+
+    async def handle_donor_response_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+        
+        if data == "back_to_menu":
+            await self.show_doctor_menu(update, context)
+            return MC_MENU
+
+        if data.startswith("view_donor_"):
+            resp_id = int(data.replace("view_donor_", ""))
+            conn = self.get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute("""
+                SELECT dr.id, u.first_name, u.last_name, u.username, u.blood_type,
+                       u.medical_certificate_file_id, u.medical_certificate_date, u.last_donation_date
+                FROM donation_responses dr
+                JOIN users u ON dr.user_id = u.telegram_id
+                WHERE dr.id = %s
+            """, (resp_id,))
+            donor = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            
+            msg = f"👤 **Донор:** {donor['first_name']} {donor['last_name'] or ''}\n"
+            msg += f"🩸 Группа: {donor['blood_type']}\n"
+            # msg += f"📞 Тел: {donor.get('phone_number') or 'Не указан'}\n" # Phone number removed for now
+            msg += f"📅 Посл. сдача: {donor['last_donation_date'] or 'Нет данных'}\n\n"
+            
+            if donor['medical_certificate_file_id']:
+                msg += "✅ **Мед. справка загружена**\n"
+                msg += f"Дата: {donor['medical_certificate_date']}\n"
+            else:
+                msg += "❌ Справка не загружена\n"
+                
+            keyboard = [
+                [InlineKeyboardButton("✅ Подтвердить (Сдал)", callback_data=f"confirm_donation_{resp_id}")],
+                [InlineKeyboardButton("⛔ Отклонить (Не пришел)", callback_data=f"reject_donation_{resp_id}")],
+                [InlineKeyboardButton("🔙 К списку", callback_data="donor_responses")]
+            ]
+            
+            # Check if message text is different before editing, to avoid "Message is not modified" error
+            # Or just use a new message. Editing is better.
+            # Since we don't have the previous message text easily, we rely on the fact that the user clicked a button
+            # which usually warrants an update.
+            
+            try:
+                await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            except Exception as e:
+                # If message not modified, maybe just answer
+                pass
+            
+            if donor['medical_certificate_file_id']:
+                try:
+                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=donor['medical_certificate_file_id'], caption="Справка донора")
+                except Exception as e:
+                    logger.error(f"Error sending photo: {e}")
+            
+            return MC_MENU
+
+        if data.startswith("confirm_donation_"):
+            resp_id = int(data.replace("confirm_donation_", ""))
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+            
+            # Update response status
+            cursor.execute("UPDATE donation_responses SET status = 'completed' WHERE id = %s RETURNING user_id", (resp_id,))
+            row = cursor.fetchone()
+            if row:
+                user_id = row[0]
+                # Update user last donation date
+                cursor.execute("UPDATE users SET last_donation_date = CURRENT_DATE WHERE telegram_id = %s", (user_id,))
+                conn.commit()
+            
+            cursor.close()
+            conn.close()
+            
+            await update.callback_query.edit_message_text("✅ Донация подтверждена! Таймер донора обновлен.")
+            
+            # Notify user
+            try:
+                if row:
+                    await context.bot.send_message(user_id, "🎉 Спасибо за донацию! Ваша дата последней сдачи крови обновлена.")
+            except:
+                pass
+                
+            await self.show_donor_responses_v2(update, context)
+            return MC_MENU
+
+        if data.startswith("reject_donation_"):
+            resp_id = int(data.replace("reject_donation_", ""))
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+            
+            # Update response status
+            cursor.execute("UPDATE donation_responses SET status = 'rejected' WHERE id = %s RETURNING user_id", (resp_id,))
+            row = cursor.fetchone()
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            await update.callback_query.edit_message_text("⛔ Заявка отклонена.")
+            
+            # Notify user
+            try:
+                if row:
+                     user_id = row[0]
+                     await context.bot.send_message(user_id, "😔 Врач отметил, что донация не состоялась.")
+            except:
+                pass
+
+            await self.show_donor_responses_v2(update, context)
+            return MC_MENU
+
+        return MC_MENU
 
     def is_doctor(self, user_id):
         """Проверяет, является ли пользователь врачом"""
@@ -584,66 +1409,126 @@ class BloodDonorBot:
             logger.error(f"Ошибка показа информации пользователя: {e}")
 
     async def show_my_donations(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показывает донации пользователя"""
+        """Показывает донации пользователя (New Implementation)"""
         user = update.effective_user
         try:
             conn = self.get_db_connection()
             cursor = conn.cursor(cursor_factory=RealDictCursor)
 
-            # Получаем все отклики пользователя
+            # Fetch from donation_responses linked to medical_centers
             cursor.execute("""
-                SELECT dr.blood_type, dr.hospital_name, dr.location, dr.address, 
-                       dr.contact_info, dr.request_date, resp.responded_at,
-                       dr.created_at
-                FROM donor_responses resp
-                JOIN donation_requests dr ON resp.request_id = dr.id
-                WHERE resp.donor_id = %s
-                ORDER BY resp.responded_at DESC
+                SELECT dr.id, dr.status, dr.created_at, mc.name, mc.address, mc.city, mc.contact_info
+                FROM donation_responses dr
+                JOIN medical_centers mc ON dr.medical_center_id = mc.id
+                WHERE dr.user_id = %s
+                ORDER BY dr.created_at DESC
                 LIMIT 10
             """, (user.id,))
 
             donations = cursor.fetchall()
-
-            if donations:
-                text = "🩸 Мои донации (отклики):\n\n"
-                for i, donation in enumerate(donations, 1):
-                    status_emoji = "📅" if donation['request_date'] >= datetime.now().date() else "✅"
-                    
-                    text += f"{i}. {status_emoji} 🩸 {donation['blood_type']} | 📍 {donation['location']}\n"
-                    text += f"🏥 {donation['hospital_name']}\n"
-                    text += f"📍 {donation['address']}\n"
-                    text += f"📞 {donation['contact_info']}\n"
-                    text += f"📅 Дата донации: {donation['request_date'].strftime('%d.%m.%Y')}\n"
-                    text += f"🕒 Откликнулись: {donation['responded_at'].strftime('%d.%m.%Y %H:%M')}\n\n"
-            else:
-                text = "У вас пока нет откликов на донации.\n\nКогда появятся запросы крови вашей группы, вы получите уведомления."
-
-            keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
-
             cursor.close()
             conn.close()
+
+            if donations:
+                text = "🩸 **Мои заявки на донацию**:\n\n"
+                keyboard = []
+                
+                for i, d in enumerate(donations, 1):
+                    status_map = {
+                        'pending': '⏳ Ожидает подтверждения',
+                        'approved': '✅ Одобрено',
+                        'completed': '🩸 Сдано',
+                        'cancelled': '❌ Отменено',
+                        'rejected': '⛔ Отклонено'
+                    }
+                    status = status_map.get(d['status'], d['status'])
+                    
+                    text += f"{i}. 🏥 **{d['name']}**\n"
+                    text += f"   📍 {d['city']}, {d['address']}\n"
+                    text += f"   📅 {d['created_at'].strftime('%d.%m.%Y %H:%M')}\n"
+                    text += f"   Статус: {status}\n\n"
+                    
+                    # Add cancel button if pending
+                    if d['status'] == 'pending':
+                        keyboard.append([InlineKeyboardButton(f"❌ Отменить заявку в {d['name']}", callback_data=f"cancel_app_{d['id']}")])
+
+                keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")])
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+            else:
+                text = "У вас пока нет заявок на донацию."
+                keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+
         except Exception as e:
             logger.error(f"Ошибка показа донаций пользователя: {e}")
             await update.callback_query.edit_message_text("Произошла ошибка при загрузке донаций.")
 
+    async def handle_user_app_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+        
+        if data.startswith("cancel_app_"):
+            app_id = int(data.replace("cancel_app_", ""))
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+            
+            # Check if still pending
+            cursor.execute("SELECT status FROM donation_responses WHERE id = %s AND user_id = %s", (app_id, update.effective_user.id))
+            row = cursor.fetchone()
+            
+            if row and row[0] == 'pending':
+                cursor.execute("UPDATE donation_responses SET status = 'cancelled' WHERE id = %s", (app_id,))
+                conn.commit()
+                await query.answer("Заявка отменена")
+            else:
+                await query.answer("Невозможно отменить (уже обработана)")
+                
+            cursor.close()
+            conn.close()
+            
+            await self.show_my_donations(update, context)
+            return USER_MENU
+            
+        return USER_MENU
+
     async def update_location(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обновляет местоположение пользователя"""
-        new_location = update.message.text
         user = update.effective_user
+        
+        latitude = None
+        longitude = None
+        new_location = None
+
+        if update.message.location:
+            loc = update.message.location
+            latitude = loc.latitude
+            longitude = loc.longitude
+            new_location = f"Координаты: {latitude:.4f}, {longitude:.4f}"
+        else:
+            new_location = update.message.text
+            
         logger.info(f"Обновление местоположения для пользователя {user.id}: {new_location}")
 
         try:
             conn = self.get_db_connection()
             cursor = conn.cursor()
 
-            cursor.execute("""
-                UPDATE users
-                SET location = %s
-                WHERE telegram_id = %s
-            """, (new_location, user.id))
+            if latitude and longitude:
+                cursor.execute("""
+                    UPDATE users
+                    SET location = %s, latitude = %s, longitude = %s
+                    WHERE telegram_id = %s
+                """, (new_location, latitude, longitude, user.id))
+            else:
+                cursor.execute("""
+                    UPDATE users
+                    SET location = %s, latitude = NULL, longitude = NULL
+                    WHERE telegram_id = %s
+                """, (new_location, user.id))
 
             conn.commit()
             cursor.close()
@@ -714,33 +1599,53 @@ class BloodDonorBot:
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await update.callback_query.edit_message_text(
-            "🩸 Создание запроса на сдачу крови\n\n"
-            "Выберите нужную группу крови:",
-            reply_markup=reply_markup
-        )
+        msg = "🩸 Создание запроса на сдачу крови\n\nВыберите нужную группу крови:"
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(msg, reply_markup=reply_markup)
+        return ENTERING_DONATION_REQUEST
 
     async def handle_blood_type_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка выбора группы крови для запроса"""
         query = update.callback_query
         await query.answer()
-
+        
         logger.info(f"Получен callback_data: {query.data}")
-
+        
         if query.data == "back_to_menu":
             await self.show_doctor_menu(update, context)
             return DOCTOR_MENU
-
-        blood_type = query.data.replace('request_', '')
-        context.user_data['request_blood_type'] = blood_type
-
-        logger.info(f"Выбрана группа крови для запроса: {blood_type}")
-
-        await query.edit_message_text(
-            f"✅ Выбрана группа крови: {blood_type}\n\n"
-            "Укажите город, где нужна кровь:"
-        )
-        return ENTERING_REQUEST_LOCATION
+            
+        if query.data.startswith('request_'):
+            blood_type = query.data.replace('request_', '')
+            context.user_data['request_blood_type'] = blood_type
+            logger.info(f"Выбрана группа крови для запроса: {blood_type}")
+            
+            # Pre-fill info from MC if available
+            mc = context.user_data.get('mc_info')
+            if mc:
+                context.user_data['request_location'] = mc.get('city')
+                context.user_data['request_hospital'] = mc.get('name')
+                context.user_data['request_address'] = mc.get('address')
+                context.user_data['request_contact'] = mc.get('contact_info')
+                
+                await query.edit_message_text(
+                    f"🩸 Группа крови: {blood_type}\n"
+                    f"🏥 Центр: {mc.get('name')}\n"
+                    f"📍 Адрес: {mc.get('address')}\n\n"
+                    "📅 Введите дату, когда нужна кровь (в формате ДД.ММ.ГГГГ):\n"
+                    "(Дата должна быть не раньше сегодняшней)"
+                )
+                return ENTERING_REQUEST_DATE
+            
+            await query.edit_message_text(
+                f"✅ Выбрана группа крови: {blood_type}\n\n"
+                "📍 Введите город, где нужна кровь:"
+            )
+            return ENTERING_REQUEST_LOCATION
+            
+        return ENTERING_DONATION_REQUEST
 
     async def handle_request_location(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка ввода города для запроса"""
@@ -1144,21 +2049,17 @@ class BloodDonorBot:
 🏥 Медицинский центр: {hospital_name}
 📍 Адрес: {address}
 📅 Дата: {request_date.strftime('%d.%m.%Y')}
+📞 Контакты: {contact_info}
 
-📞 Контактная информация:
-{contact_info}
-
-Если вы можете помочь, пожалуйста, нажмите кнопку ниже или свяжитесь с медицинским учреждением по указанным контактам.
-
-Спасибо за вашу готовность помочь! ❤️
+Если вы готовы сдать кровь, нажмите кнопку ниже, чтобы откликнуться.
                     """
-
-                    # Создаем кнопку отклика
+                    
                     keyboard = [
-                        [InlineKeyboardButton("✅ Могу помочь!", callback_data=f"respond_{request_id}")]
+                        [InlineKeyboardButton("✅ Я готов сдать!", callback_data=f"respond_{request_id}")],
+                        [InlineKeyboardButton("❌ Не могу", callback_data="ignore_request")]
                     ]
                     reply_markup = InlineKeyboardMarkup(keyboard)
-
+                    
                     try:
                         await self.application.bot.send_message(
                             chat_id=donor['telegram_id'],
@@ -1166,8 +2067,8 @@ class BloodDonorBot:
                             reply_markup=reply_markup
                         )
                         sent_count += 1
-                        logger.info(f"Уведомление отправлено донору {donor['telegram_id']}")
                     except Exception as e:
+                        logger.error(f"Не удалось отправить сообщение донору {donor['telegram_id']}: {e}")
                         logger.error(f"Ошибка отправки уведомления донору {donor['telegram_id']}: {e}")
 
             logger.info(f"Отправлено {sent_count} уведомлений из {len(donors)} возможных доноров")
@@ -1382,6 +2283,125 @@ class BloodDonorBot:
 
         await update.callback_query.edit_message_text(help_text, reply_markup=reply_markup)
 
+    # --- EDIT MC INFO ---
+    async def show_edit_mc_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        mc_id = context.user_data.get('mc_id')
+        conn = self.get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT name, address, city, contact_info FROM medical_centers WHERE id = %s", (mc_id,))
+        mc = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        msg = f"🏥 **Редактирование Медицинского Центра**\n\n"
+        msg += f"Название: {mc['name']}\n"
+        msg += f"Адрес: {mc['address']}\n"
+        msg += f"Город: {mc['city']}\n"
+        msg += f"Контакты: {mc['contact_info'] or 'Не указано'}\n\n"
+        msg += "Выберите, что хотите изменить (пока только контакты и адрес):"
+        
+        keyboard = [
+             [InlineKeyboardButton("📝 Изменить адрес", callback_data="edit_mc_address")],
+             [InlineKeyboardButton("📞 Изменить контакты", callback_data="edit_mc_contact")],
+             [InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")]
+        ]
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        else:
+            await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        return MC_EDIT_INFO
+
+    async def handle_edit_mc_choice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+        
+        if data == "back_to_menu":
+            await self.show_doctor_menu(update, context)
+            return MC_MENU
+            
+        if data == "edit_mc_address":
+            await query.edit_message_text("📍 Введите новый адрес медицинского центра:")
+            context.user_data['edit_mc_field'] = 'address'
+            return MC_EDIT_INPUT
+            
+        if data == "edit_mc_contact":
+            await query.edit_message_text("📞 Введите новую контактную информацию (телефон, время работы):")
+            context.user_data['edit_mc_field'] = 'contact_info'
+            return MC_EDIT_INPUT
+            
+        return MC_EDIT_INFO
+
+    async def process_mc_edit_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        new_value = update.message.text
+        field = context.user_data.get('edit_mc_field')
+        mc_id = context.user_data.get('mc_id')
+        
+        if field and mc_id:
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+            query = f"UPDATE medical_centers SET {field} = %s WHERE id = %s"
+            cursor.execute(query, (new_value, mc_id))
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            await update.message.reply_text("✅ Информация обновлена!")
+            # Update session info
+            if 'mc_info' in context.user_data:
+                context.user_data['mc_info'][field] = new_value
+            
+            await self.show_edit_mc_menu(update, context)
+            return MC_EDIT_INFO
+            
+        await update.message.reply_text("❌ Ошибка обновления.")
+        return MC_MENU
+
+    async def broadcast_need(self, mc_id, blood_type):
+        try:
+            conn = self.get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            # Get MC info
+            cursor.execute("SELECT name, city FROM medical_centers WHERE id = %s", (mc_id,))
+            mc = cursor.fetchone()
+            
+            # Find users
+            cursor.execute("""
+                SELECT telegram_id, first_name 
+                FROM users 
+                WHERE role = 'user' 
+                AND blood_type = %s 
+                AND (city = %s OR location ILIKE %s)
+                AND (last_donation_date IS NULL OR last_donation_date < CURRENT_DATE - INTERVAL '60 days')
+            """, (blood_type, mc['city'], f"%{mc['city']}%"))
+            
+            users = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            
+            count = 0
+            for user in users:
+                try:
+                    await self.application.bot.send_message(
+                        chat_id=user['telegram_id'],
+                        text=f"🚨 **СРОЧНО НУЖНА КРОВЬ!**\n\n"
+                             f"Центр: {mc['name']} ({mc['city']})\n"
+                             f"Группа: {blood_type}\n\n"
+                             f"Пожалуйста, если вы можете сдать кровь, откликнитесь через меню 'Хочу сдать кровь'!",
+                        parse_mode='Markdown'
+                    )
+                    count += 1
+                except Exception as e:
+                    logger.error(f"Failed to send broadcast to {user['telegram_id']}: {e}")
+            
+            logger.info(f"Broadcast sent to {count} donors")
+            return count
+        except Exception as e:
+            logger.error(f"Broadcast error: {e}")
+            return 0
+
     def run(self):
         """Запуск бота"""
         # Создаем приложение
@@ -1402,7 +2422,10 @@ class BloodDonorBot:
                     CallbackQueryHandler(self.handle_blood_type),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_blood_type)
                 ],
-                ENTERING_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_location)],
+                ENTERING_LOCATION: [
+                    MessageHandler(filters.LOCATION, self.handle_location),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_location)
+                ],
                 ENTERING_LAST_DONATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_last_donation)],
                 ENTERING_DONATION_REQUEST: [CallbackQueryHandler(self.handle_blood_type_request)],
                 ENTERING_REQUEST_LOCATION: [
@@ -1416,7 +2439,30 @@ class BloodDonorBot:
                 ENTERING_REQUEST_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_request_date)],
                 USER_MENU: [CallbackQueryHandler(self.handle_menu_callback)],
                 DOCTOR_MENU: [CallbackQueryHandler(self.handle_menu_callback)],
-                UPDATE_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.update_location)],
+                MC_MENU: [CallbackQueryHandler(self.handle_menu_callback)],
+                MC_AUTH_MENU: [CallbackQueryHandler(self.handle_mc_auth_choice)],
+                MC_REGISTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_mc_name)],
+                MC_REGISTER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_mc_address)],
+                MC_REGISTER_CITY: [
+                    MessageHandler(filters.LOCATION, self.process_mc_city),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_mc_city)
+                ],
+                MC_REGISTER_LOGIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_mc_reg_login)],
+                MC_REGISTER_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_mc_reg_password)],
+                MC_LOGIN_LOGIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_mc_login_input)],
+                MC_LOGIN_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_mc_login_password)],
+                MC_EDIT_INFO: [CallbackQueryHandler(self.handle_edit_mc_choice)],
+                MC_EDIT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_mc_edit_input)],
+                MANAGE_BLOOD_NEEDS: [CallbackQueryHandler(self.handle_traffic_light_action)],
+                DONOR_SEARCH_MC: [CallbackQueryHandler(self.handle_donation_search_action)],
+                DONOR_CERT_UPLOAD: [
+                     CallbackQueryHandler(self.handle_cert_menu_callback),
+                     MessageHandler(filters.PHOTO, self.process_cert_upload)
+                ],
+                UPDATE_LOCATION: [
+                    MessageHandler(filters.LOCATION, self.update_location),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.update_location)
+                ],
                 UPDATE_DONATION_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.update_donation_date)],
                 UPDATE_BLOOD_TYPE: [CallbackQueryHandler(self.process_update_blood_type)]
             },

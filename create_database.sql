@@ -7,6 +7,30 @@ CREATE DATABASE blood_donor_bot;
 -- Подключение к созданной базе данных
 \c blood_donor_bot;
 
+-- Создание таблицы медицинских центров
+CREATE TABLE medical_centers (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    address VARCHAR(255) NOT NULL,
+    city VARCHAR(100) NOT NULL,
+    latitude FLOAT,
+    longitude FLOAT,
+    login VARCHAR(50) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    contact_info TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Создание таблицы потребностей крови (Светофор)
+CREATE TABLE blood_needs (
+    id SERIAL PRIMARY KEY,
+    medical_center_id INTEGER REFERENCES medical_centers(id),
+    blood_type VARCHAR(10) NOT NULL, -- A+, A-, B+, etc.
+    status VARCHAR(20) DEFAULT 'ok' CHECK (status IN ('ok', 'need', 'urgent')),
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(medical_center_id, blood_type)
+);
+
 -- Создание таблицы пользователей
 CREATE TABLE users (
     id SERIAL PRIMARY KEY,
@@ -16,79 +40,47 @@ CREATE TABLE users (
     last_name VARCHAR(255),
     role VARCHAR(20) NOT NULL CHECK (role IN ('user', 'doctor')),
     blood_type VARCHAR(10),
-    location VARCHAR(255),
+    city VARCHAR(100),
+    latitude FLOAT,
+    longitude FLOAT,
     last_donation_date DATE,
+    medical_certificate_file_id VARCHAR(255),
+    medical_certificate_date DATE,
     is_registered BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Создание таблицы запросов на сдачу крови
+-- Создание таблицы запросов на сдачу крови (Старый функционал, можно оставить или мигрировать)
 CREATE TABLE donation_requests (
     id SERIAL PRIMARY KEY,
-    doctor_id BIGINT NOT NULL,
+    doctor_id BIGINT NOT NULL, -- Ссылка на telegram_id врача (если врач привязан к user)
+    medical_center_id INTEGER REFERENCES medical_centers(id), -- Ссылка на медцентр
     blood_type VARCHAR(10) NOT NULL,
     location VARCHAR(255) NOT NULL,
     request_date DATE NOT NULL,
     description TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (doctor_id) REFERENCES users(telegram_id)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    -- FOREIGN KEY (doctor_id) REFERENCES users(telegram_id) -- Опционально
 );
 
--- Создание индексов для улучшения производительности
+-- Таблица для отслеживания откликов доноров
+CREATE TABLE donation_responses (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT REFERENCES users(telegram_id),
+    medical_center_id INTEGER REFERENCES medical_centers(id),
+    status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'completed', 'cancelled')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Индексы
 CREATE INDEX idx_users_telegram_id ON users(telegram_id);
 CREATE INDEX idx_users_role ON users(role);
 CREATE INDEX idx_users_blood_type ON users(blood_type);
-CREATE INDEX idx_users_location ON users(location);
-CREATE INDEX idx_users_registered ON users(is_registered);
+CREATE INDEX idx_users_city ON users(city);
+CREATE INDEX idx_medical_centers_city ON medical_centers(city);
+CREATE INDEX idx_blood_needs_status ON blood_needs(status);
 
-CREATE INDEX idx_donation_requests_doctor_id ON donation_requests(doctor_id);
-CREATE INDEX idx_donation_requests_blood_type ON donation_requests(blood_type);
-CREATE INDEX idx_donation_requests_location ON donation_requests(location);
-CREATE INDEX idx_donation_requests_date ON donation_requests(request_date);
-
--- Создание представления для статистики
-CREATE VIEW donor_statistics AS
-SELECT 
-    blood_type,
-    COUNT(*) as total_donors,
-    COUNT(CASE WHEN last_donation_date IS NULL THEN 1 END) as new_donors,
-    COUNT(CASE WHEN last_donation_date IS NOT NULL THEN 1 END) as experienced_donors,
-    COUNT(CASE WHEN last_donation_date < CURRENT_DATE - INTERVAL '60 days' THEN 1 END) as available_donors
-FROM users 
-WHERE role = 'user' AND is_registered = TRUE
-GROUP BY blood_type;
-
--- Создание представления для активных запросов
-CREATE VIEW active_requests AS
-SELECT 
-    dr.id,
-    dr.blood_type,
-    dr.location,
-    dr.request_date,
-    dr.created_at,
-    u.first_name as doctor_name
-FROM donation_requests dr
-JOIN users u ON dr.doctor_id = u.telegram_id
-WHERE dr.request_date >= CURRENT_DATE
-ORDER BY dr.request_date ASC;
-
--- Комментарии к таблицам
-COMMENT ON TABLE users IS 'Таблица пользователей бота (доноры и врачи)';
-COMMENT ON TABLE donation_requests IS 'Таблица запросов на сдачу крови от врачей';
-COMMENT ON COLUMN users.telegram_id IS 'ID пользователя в Telegram';
-COMMENT ON COLUMN users.role IS 'Роль пользователя: user (донор) или doctor (врач)';
-COMMENT ON COLUMN users.blood_type IS 'Группа крови пользователя';
-COMMENT ON COLUMN users.location IS 'Местоположение пользователя';
-COMMENT ON COLUMN users.last_donation_date IS 'Дата последней сдачи крови';
-COMMENT ON COLUMN donation_requests.doctor_id IS 'ID врача, создавшего запрос';
-COMMENT ON COLUMN donation_requests.blood_type IS 'Требуемая группа крови';
-COMMENT ON COLUMN donation_requests.location IS 'Местоположение, где нужна кровь';
-COMMENT ON COLUMN donation_requests.request_date IS 'Дата, когда нужна кровь';
-
--- Вывод информации о созданных объектах
-SELECT 'База данных blood_donor_bot успешно создана!' as status;
-SELECT 'Таблицы созданы:' as tables;
-SELECT '  - users' as table_name;
-SELECT '  - donation_requests' as table_name;
-SELECT 'Индексы созданы для оптимизации запросов' as indexes;
-SELECT 'Представления созданы для статистики' as views; 
+-- Комментарии
+COMMENT ON TABLE medical_centers IS 'Медицинские центры';
+COMMENT ON TABLE blood_needs IS 'Потребности в крови по центрам';
+COMMENT ON TABLE users IS 'Пользователи (доноры и врачи)';
