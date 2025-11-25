@@ -1940,7 +1940,8 @@ class BloodDonorBot:
 
         except Exception as e:
             logger.error(f"Ошибка при показе релевантных запросов: {e}")
-            await update.callback_query.edit_message_text("Произошла ошибка при загрузке запросов.")
+            keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")]]
+            await update.callback_query.edit_message_text("Произошла ошибка при загрузке запросов.", reply_markup=InlineKeyboardMarkup(keyboard))
             return USER_MENU
 
     async def show_my_requests(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
@@ -2010,7 +2011,8 @@ class BloodDonorBot:
 
         except Exception as e:
             logger.error(f"Ошибка показа запросов врача: {e}")
-            await update.callback_query.edit_message_text("Произошла ошибка при загрузке запросов.")
+            keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")]]
+            await update.callback_query.edit_message_text("Произошла ошибка при загрузке запросов.", reply_markup=InlineKeyboardMarkup(keyboard))
 
     async def show_donor_responses(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показывает отклики доноров на запросы врача"""
