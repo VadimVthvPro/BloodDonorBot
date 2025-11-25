@@ -652,6 +652,7 @@ class BloodDonorBot:
     async def show_user_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показывает меню пользователя"""
         keyboard = [
+            [InlineKeyboardButton("🔔 Входящие запросы", callback_data="relevant_requests")],
             [InlineKeyboardButton("💉 Хочу сдать кровь", callback_data="want_to_donate")],
             [InlineKeyboardButton("📄 Мед. справка", callback_data="my_certs")],
             [InlineKeyboardButton("📊 Моя информация", callback_data="user_info")],
@@ -745,6 +746,17 @@ class BloodDonorBot:
         if query.data == "user_info":
             await self.show_user_info(update, context)
             return USER_MENU
+        elif query.data == "relevant_requests":
+            await self.show_relevant_requests(update, context)
+            return USER_MENU
+        elif query.data.startswith("rel_req_page_"):
+            page = int(query.data.split("_")[-1])
+            await self.show_relevant_requests(update, context, page=page)
+            return USER_MENU
+        elif query.data.startswith("my_req_page_"):
+            page = int(query.data.split("_")[-1])
+            await self.show_my_requests(update, context, page=page)
+            return DOCTOR_MENU
         elif query.data.startswith("cancel_app_"):
             await self.handle_user_app_action(update, context)
             return USER_MENU
@@ -1805,12 +1817,130 @@ class BloodDonorBot:
         
         return UPDATE_BLOOD_TYPE
 
-    async def show_my_requests(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показывает запросы врача"""
+    async def show_relevant_requests(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
+        """Показывает входящие (релевантные) запросы для донора"""
         user = update.effective_user
+        items_per_page = 5
+        
         try:
             conn = self.get_db_connection()
             cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            # Get user info for filters
+            cursor.execute("SELECT blood_type, city, latitude, longitude FROM users WHERE telegram_id = %s", (user.id,))
+            donor_info = cursor.fetchone()
+            
+            if not donor_info or not donor_info['blood_type']:
+                await update.callback_query.edit_message_text("❌ Сначала заполните информацию о себе (группа крови).")
+                cursor.close()
+                conn.close()
+                return USER_MENU
+
+            # Fetch active requests matching blood type
+            # We fetch more than needed to filter by radius in python if needed, 
+            # or we can try to filter by city in SQL. 
+            # Let's fetch all matching blood type and future date, then filter/paginate.
+            
+            cursor.execute("""
+                SELECT dr.id, dr.blood_type, dr.location, dr.address, dr.hospital_name, 
+                       dr.contact_info, dr.request_date, mc.latitude, mc.longitude
+                FROM donation_requests dr
+                LEFT JOIN medical_centers mc ON dr.medical_center_id = mc.id
+                WHERE dr.blood_type = %s 
+                AND dr.request_date >= CURRENT_DATE
+                ORDER BY dr.request_date ASC
+            """, (donor_info['blood_type'],))
+            
+            all_requests = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            
+            # Filter by radius if coordinates exist
+            filtered_requests = []
+            donor_lat = donor_info['latitude']
+            donor_lon = donor_info['longitude']
+            
+            for req in all_requests:
+                # Distance check (50km)
+                if donor_lat and req['latitude']:
+                     dist = self.calculate_distance(donor_lat, donor_lon, req['latitude'], req['longitude'])
+                     if dist <= 50:
+                         req['distance'] = dist
+                         filtered_requests.append(req)
+                elif donor_info['city'] and req['location'] and donor_info['city'].lower() in req['location'].lower():
+                     # Fallback to city match
+                     req['distance'] = None
+                     filtered_requests.append(req)
+                elif not donor_info['city'] and not donor_lat:
+                     # No location info from donor? Show all matching blood type? 
+                     # Or maybe ask to set location. Let's show all for now but mark as "Distance unknown"
+                     req['distance'] = None
+                     filtered_requests.append(req)
+
+            # Pagination
+            total_items = len(filtered_requests)
+            start_index = page * items_per_page
+            end_index = start_index + items_per_page
+            current_page_items = filtered_requests[start_index:end_index]
+            
+            if not current_page_items:
+                if page == 0:
+                    text = "📭 Сейчас нет активных запросов для вашей группы крови поблизости."
+                    keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")]]
+                    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+                    return USER_MENU
+                else:
+                    # Should not happen if logic is correct, but safe fallback
+                    await self.show_relevant_requests(update, context, page=0)
+                    return USER_MENU
+
+            text = f"🔔 **Входящие запросы** (Стр. {page + 1})\n\n"
+            
+            keyboard = []
+            
+            for req in current_page_items:
+                dist_str = f" (~{req['distance']:.1f} км)" if req.get('distance') is not None else ""
+                text += f"🩸 **{req['blood_type']}** | 🏥 {req['hospital_name']}\n"
+                text += f"📍 {req['location']}, {req['address']}{dist_str}\n"
+                text += f"📅 {req['request_date'].strftime('%d.%m.%Y')}\n"
+                text += f"📞 {req['contact_info']}\n\n"
+                
+                # Button to respond to specific request
+                keyboard.append([InlineKeyboardButton(f"✅ Откликнуться: {req['hospital_name']}", callback_data=f"respond_{req['id']}")])
+
+            # Nav buttons
+            nav_row = []
+            if page > 0:
+                nav_row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"rel_req_page_{page-1}"))
+            if end_index < total_items:
+                nav_row.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"rel_req_page_{page+1}"))
+            
+            if nav_row:
+                keyboard.append(nav_row)
+                
+            keyboard.append([InlineKeyboardButton("🔙 В главное меню", callback_data="back_to_menu")])
+            
+            await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            return USER_MENU
+
+        except Exception as e:
+            logger.error(f"Ошибка при показе релевантных запросов: {e}")
+            await update.callback_query.edit_message_text("Произошла ошибка при загрузке запросов.")
+            return USER_MENU
+
+    async def show_my_requests(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
+        """Показывает запросы врача с пагинацией"""
+        user = update.effective_user
+        items_per_page = 5
+        offset = page * items_per_page
+        
+        try:
+            conn = self.get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+            # Count total
+            cursor.execute("SELECT COUNT(*) as count FROM donation_requests WHERE doctor_id = %s", (user.id,))
+            total_count = cursor.fetchone()['count']
 
             cursor.execute("""
                 SELECT dr.id, dr.doctor_id, dr.blood_type, dr.location, 
@@ -1826,13 +1956,15 @@ class BloodDonorBot:
                          dr.hospital_name, dr.address, dr.contact_info,
                          dr.request_date, dr.description, dr.created_at
                 ORDER BY dr.created_at DESC 
-                LIMIT 10
-            """, (user.id,))
+                LIMIT %s OFFSET %s
+            """, (user.id, items_per_page, offset))
 
             requests = cursor.fetchall()
+            cursor.close()
+            conn.close()
 
             if requests:
-                text = "📋 Ваши последние запросы:\n\n"
+                text = f"📋 **Ваши запросы** (Стр. {page + 1})\n\n"
                 for i, req in enumerate(requests, 1):
                     response_text = f"📊 Откликов: {req['response_count']}"
                     
@@ -1841,16 +1973,26 @@ class BloodDonorBot:
                     text += f"📍 {req['address']}\n"
                     text += f"📞 {req['contact_info']}\n"
                     text += f"📅 {req['request_date'].strftime('%d.%m.%Y')} | 🕒 {req['created_at'].strftime('%d.%m.%Y %H:%M')}\n\n"
+                
+                keyboard = []
+                nav_row = []
+                if page > 0:
+                    nav_row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"my_req_page_{page-1}"))
+                if (offset + items_per_page) < total_count:
+                    nav_row.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"my_req_page_{page+1}"))
+                
+                if nav_row:
+                    keyboard.append(nav_row)
+                
+                keyboard.append([InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")])
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
             else:
                 text = "У вас пока нет созданных запросов."
+                keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]]
+                await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-            keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
-
-            cursor.close()
-            conn.close()
         except Exception as e:
             logger.error(f"Ошибка показа запросов врача: {e}")
             await update.callback_query.edit_message_text("Произошла ошибка при загрузке запросов.")
