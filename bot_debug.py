@@ -671,14 +671,14 @@ class BloodDonorBot:
         keyboard = [
             [InlineKeyboardButton("🔔 Входящие запросы", callback_data="relevant_requests")],
             [InlineKeyboardButton("💉 Хочу сдать кровь", callback_data="want_to_donate")],
+            [InlineKeyboardButton("🚦 Донорский светофор", callback_data="user_traffic_light")],
             [InlineKeyboardButton("📄 Мед. справка", callback_data="my_certs")],
             [InlineKeyboardButton("📊 Моя информация", callback_data="user_info")],
             [InlineKeyboardButton("🩸 Мои донации", callback_data="my_donations")],
             [InlineKeyboardButton("🩸 Изменить группу крови", callback_data="update_blood_type")],
             [InlineKeyboardButton("📅 Обновить дату сдачи", callback_data="update_donation")],
             [InlineKeyboardButton("📍 Изменить местоположение", callback_data="update_location")],
-            [InlineKeyboardButton("🔄 Сменить роль", callback_data="switch_role")],
-            [InlineKeyboardButton("❓ Помощь", callback_data="help")]
+            [InlineKeyboardButton("🔄 Сменить роль", callback_data="switch_role")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -765,6 +765,9 @@ class BloodDonorBot:
             return USER_MENU
         elif query.data == "relevant_requests":
             await self.show_relevant_requests(update, context)
+            return USER_MENU
+        elif query.data == "user_traffic_light":
+            await self.show_user_traffic_light(update, context)
             return USER_MENU
         elif query.data.startswith("rel_req_page_"):
             page = int(query.data.split("_")[-1])
@@ -1624,6 +1627,72 @@ class BloodDonorBot:
         except Exception as e:
             logger.error(f"Ошибка обновления даты сдачи: {e}")
             await update.message.reply_text("Произошла ошибка при обновлении даты сдачи.")
+            return USER_MENU
+
+    async def show_user_traffic_light(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает пользователю 'Светофор донора' (потребности МЦ поблизости)"""
+        user = update.effective_user
+        try:
+            conn = self.get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            # Get user location
+            cursor.execute("SELECT city, latitude, longitude, blood_type FROM users WHERE telegram_id = %s", (user.id,))
+            user_data = cursor.fetchone()
+            
+            if not user_data:
+                await update.callback_query.edit_message_text("Ошибка: данные пользователя не найдены.")
+                cursor.close()
+                conn.close()
+                return USER_MENU
+
+            # Fetch all needs
+            cursor.execute("""
+                SELECT bn.blood_type, bn.status, mc.name, mc.city, mc.latitude, mc.longitude 
+                FROM blood_needs bn
+                JOIN medical_centers mc ON bn.medical_center_id = mc.id
+                WHERE bn.status IN ('need', 'urgent')
+            """)
+            needs = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            
+            relevant_needs = []
+            user_lat = user_data['latitude']
+            user_lon = user_data['longitude']
+            
+            for need in needs:
+                # Filter by radius (50km) or city
+                is_nearby = False
+                dist_str = ""
+                
+                if user_lat and need['latitude']:
+                    dist = self.calculate_distance(user_lat, user_lon, need['latitude'], need['longitude'])
+                    if dist <= 50:
+                        is_nearby = True
+                        dist_str = f" (~{dist:.1f} км)"
+                elif user_data['city'] and need['city'] and user_data['city'].lower() in need['city'].lower():
+                    is_nearby = True
+                
+                if is_nearby:
+                    need['dist_str'] = dist_str
+                    relevant_needs.append(need)
+            
+            if not relevant_needs:
+                text = "🚦 В вашем регионе сейчас нет острой потребности в крови.\nСпасибо, что остаетесь с нами!"
+            else:
+                text = "🚦 **Донорский светофор (ваш регион)**\n\n"
+                for n in relevant_needs:
+                    icon = "🔴" if n['status'] == 'urgent' else "🟡"
+                    text += f"{icon} **{n['blood_type']}**: {n['name']}{n['dist_str']}\n"
+            
+            keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")]]
+            await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+            return USER_MENU
+
+        except Exception as e:
+            logger.error(f"Error showing user traffic light: {e}")
+            await update.callback_query.edit_message_text("Ошибка загрузки светофора.")
             return USER_MENU
 
     async def create_donation_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
