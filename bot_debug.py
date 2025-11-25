@@ -1187,6 +1187,21 @@ class BloodDonorBot:
             # Check cert expiration first
             self.check_cert_expiration(update.effective_user.id)
             
+            # Check last donation date (60 days rule)
+            conn = self.get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute("SELECT last_donation_date FROM users WHERE telegram_id = %s", (update.effective_user.id,))
+            user_data = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            
+            if user_data and user_data['last_donation_date']:
+                days_since = (datetime.now().date() - user_data['last_donation_date']).days
+                if days_since < 60:
+                    days_left = 60 - days_since
+                    await update.callback_query.answer(f"⛔ Вы сможете сдать кровь только через {days_left} дн.", show_alert=True)
+                    return DONOR_SEARCH_MC
+
             mc_id = int(data.replace("agree_donate_", ""))
             conn = self.get_db_connection()
             cursor = conn.cursor()
@@ -2233,6 +2248,28 @@ class BloodDonorBot:
             conn = self.get_db_connection()
             cursor = conn.cursor(cursor_factory=RealDictCursor)
             
+            # 1. Fetch request info (date) and donor info (last donation) to check 60-day rule
+            cursor.execute("SELECT request_date FROM donation_requests WHERE id = %s", (request_id,))
+            req = cursor.fetchone()
+            if not req:
+                 await query.edit_message_text("❌ Запрос не найден.")
+                 cursor.close()
+                 conn.close()
+                 return
+            request_date = req['request_date']
+
+            cursor.execute("SELECT last_donation_date FROM users WHERE telegram_id = %s", (donor_id,))
+            donor_data = cursor.fetchone()
+            
+            if donor_data and donor_data['last_donation_date']:
+                min_allowed_date = donor_data['last_donation_date'] + timedelta(days=60)
+                if request_date < min_allowed_date:
+                     days_left = (min_allowed_date - request_date).days
+                     await query.answer(f"⛔ Дата запроса слишком ранняя! Вам нужно ждать до {min_allowed_date.strftime('%d.%m.%Y')}.", show_alert=True)
+                     cursor.close()
+                     conn.close()
+                     return
+
             # Проверяем, не откликался ли донор уже на этот запрос
             cursor.execute("""
                 SELECT id FROM donor_responses 
@@ -2257,6 +2294,7 @@ class BloodDonorBot:
             # Получаем информацию о запросе и доноре
             cursor.execute("""
                 SELECT dr.doctor_id, dr.blood_type, dr.hospital_name, dr.location, dr.request_date,
+                       dr.address, dr.contact_info,
                        u.first_name, u.last_name, u.username
                 FROM donation_requests dr
                 JOIN users u ON dr.doctor_id = u.telegram_id
@@ -2282,17 +2320,6 @@ class BloodDonorBot:
                 query.message.text + "\n\n✅ ВЫ ОТКЛИКНУЛИСЬ НА ЭТОТ ЗАПРОС!"
             )
 
-            # Получаем полную информацию о запросе из базы данных
-            cursor = conn.cursor(cursor_factory=RealDictCursor)
-            cursor.execute("""
-                SELECT hospital_name, address, contact_info
-                FROM donation_requests 
-                WHERE id = %s
-            """, (request_id,))
-            full_request_info = cursor.fetchone()
-            cursor.close()
-            conn.close()
-            
             # Отправляем подробную информацию о предстоящей донации
             donation_info = f"""
 🎯 ЗАПЛАНИРОВАННАЯ ДОНАЦИЯ
@@ -2300,11 +2327,11 @@ class BloodDonorBot:
 🩸 Группа крови: {request_info['blood_type']}
 📅 Дата: {request_info['request_date'].strftime('%d.%m.%Y')}
 
-🏥 Медицинский центр: {full_request_info['hospital_name'] or 'Не указано'}
-📍 Адрес: {full_request_info['address'] or 'Не указан'}
+🏥 Медицинский центр: {request_info['hospital_name'] or 'Не указано'}
+📍 Адрес: {request_info['address'] or 'Не указан'}
 
 📞 Контактная информация:
-{full_request_info['contact_info'] or 'Не указано'}
+{request_info['contact_info'] or 'Не указано'}
 
 ❗ ВАЖНО:
 • Не забудьте покушать за 2-3 часа до сдачи
