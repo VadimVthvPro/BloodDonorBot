@@ -115,6 +115,20 @@ class BloodDonorBot:
                 else:
                     conn.commit()
 
+            # Обновление таблицы donation_requests (новые колонки)
+            alter_requests_commands = [
+                "ALTER TABLE donation_requests ADD COLUMN IF NOT EXISTS medical_center_id INTEGER REFERENCES medical_centers(id)",
+                "ALTER TABLE donation_requests ADD COLUMN IF NOT EXISTS hospital_name VARCHAR(255)",
+                "ALTER TABLE donation_requests ADD COLUMN IF NOT EXISTS contact_info TEXT"
+            ]
+            for cmd in alter_requests_commands:
+                try:
+                    cursor.execute(cmd)
+                    conn.commit()
+                except Exception as e:
+                    logger.warning(f"Alter table donation_requests warning: {e}")
+                    conn.rollback()
+
             # Создание таблицы медицинских центров
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS medical_centers (
@@ -159,9 +173,12 @@ class BloodDonorBot:
                 CREATE TABLE IF NOT EXISTS donation_requests (
                     id SERIAL PRIMARY KEY,
                     doctor_id BIGINT NOT NULL,
+                    medical_center_id INTEGER REFERENCES medical_centers(id),
                     blood_type VARCHAR(10) NOT NULL,
                     location VARCHAR(255) NOT NULL,
                     address VARCHAR(255) NOT NULL,
+                    hospital_name VARCHAR(255),
+                    contact_info TEXT,
                     request_date DATE NOT NULL,
                     description TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
